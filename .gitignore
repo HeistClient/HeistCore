@@ -1,24 +1,27 @@
-# Maven build output
-/target/
-**/target/
-
-# IntelliJ IDEA files
-/.idea/
+# IntelliJ IDEA
+.idea/
 *.iml
 *.iws
 out/
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+
+# RuneLite
+*.log
 
 # OS files
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-
-# Eclipse files (if anyone uses Eclipse)
-.project
-.classpath
-.settings/
-
 # Other temporary files
-*.tmp
+*.class
+*.jar
