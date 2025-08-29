@@ -1,4 +1,4 @@
-package ht.heist.core;
+package ht.heist.core.config;
 
 public class HeistCoreConfig {
 }

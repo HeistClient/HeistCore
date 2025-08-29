@@ -1,4 +1,6 @@
-package ht.heist.core;
+package ht.heist.core.services;
 
-public class HeatmapService {
+public interface HeatmapService {
+    void recordClick(int x, int y);
+    void recordEvent(String event);
 }

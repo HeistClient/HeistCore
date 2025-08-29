@@ -1,4 +1,6 @@
-package ht.heist.core;
+package ht.heist.core.services;
 
-public class MouseService {
+public interface MouseService {
+    void move(int x, int y);
+    void click(int x, int y);
 }

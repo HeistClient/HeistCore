@@ -1,4 +1,6 @@
-package ht.heist.core;
+package ht.heist.core.services;
 
-public class CameraService {
+public interface CameraService {
+    void rotateTo(int angle);
+    void tiltTo(int pitch);
 }
