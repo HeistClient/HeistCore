@@ -14,48 +14,74 @@
     <packaging>jar</packaging>
 
     <dependencies>
-        <dependency>
-            <groupId>net.runelite</groupId>
-            <artifactId>client</artifactId>
-            <scope>provided</scope>
-        </dependency>
-        <dependency>
-            <groupId>net.runelite</groupId>
-            <artifactId>runelite-api</artifactId>
-            <scope>provided</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <version>1.18.32</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <!-- HeistCore core module (provides connection to Services etc.) -->
+        <!-- Shade your shared core code INTO this plugin jar -->
         <dependency>
             <groupId>ht.heistcore</groupId>
             <artifactId>core</artifactId>
             <version>${project.version}</version>
         </dependency>
 
+        <!-- RuneLite deps MUST be provided (do NOT shade these) -->
+        <dependency>
+            <groupId>net.runelite</groupId>
+            <artifactId>client</artifactId>
+            <version>${runelite.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>net.runelite</groupId>
+            <artifactId>runelite-api</artifactId>
+            <version>${runelite.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Lombok only for compile-time -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>1.18.32</version>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <!-- inherits version 3.5.0 from parent -->
+            <!-- (Optional) clean jar name -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+                <configuration>
+                    <finalName>${project.artifactId}-${project.version}</finalName>
+                </configuration>
+            </plugin>
+
+            <!-- Shade ONLY your core code; keep plugin.properties -->
+            <!-- Version 3.5.0 comes from parent pluginManagement (you already set it) -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
                 <executions>
                     <execution>
                         <phase>package</phase>
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
+                        <goals><goal>shade</goal></goals>
                         <configuration>
-                            <shadedArtifactAttached>false</shadedArtifactAttached>
+                            <!-- don’t write dependency-reduced-pom -->
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <!-- shrink anything we shaded (core) -->
+                            <minimizeJar>true</minimizeJar>
+
+                            <!-- never include RuneLite or Lombok -->
+                            <artifactSet>
+                                <excludes>
+                                    <exclude>net.runelite:client</exclude>
+                                    <exclude>net.runelite:runelite-api</exclude>
+                                    <exclude>org.projectlombok:lombok</exclude>
+                                </excludes>
+                            </artifactSet>
+
                             <transformers>
+                                <!-- keep plugin.properties in the jar root -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
                                     <resource>plugin.properties</resource>
                                 </transformer>

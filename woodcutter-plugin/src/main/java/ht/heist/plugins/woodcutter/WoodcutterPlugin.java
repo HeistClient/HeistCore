@@ -1,6 +1,12 @@
+/**
+ * WoodcutterPlugin*
+ * Handles automated tree-chopping logic with human-like behavior.
+ * Depends on MouseService + HumanizerService.
+ */
 package ht.heist.plugins.woodcutter;
 
 import com.google.inject.Provides;
+import ht.heist.core.config.HeistCoreConfig;
 import ht.heist.core.services.HumanizerService;
 import ht.heist.core.services.MouseService;
 import lombok.extern.slf4j.Slf4j;
@@ -116,6 +122,13 @@ public class WoodcutterPlugin extends Plugin
     WoodcutterConfig provideConfig(ConfigManager configManager)
     {
         return configManager.getConfig(WoodcutterConfig.class);
+    }
+
+    // ADDED: This binds HeistCoreConfig so MouseServiceImpl (and other services) can inject it
+    @Provides
+    HeistCoreConfig provideHeistCoreConfig(ConfigManager configManager)
+    {
+        return configManager.getConfig(HeistCoreConfig.class);
     }
 
     // ---------------- Tick Loop ----------------

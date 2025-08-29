@@ -25,6 +25,27 @@ public interface WoodcutterConfig extends Config {
     default TreeType treeType() {
         return TreeType.NORMAL;
     }
+    @ConfigItem(
+            keyName = "hoverClickDelayMin",
+            name = "Hover→Click Delay Min (ms)",
+            description = "Minimum delay (ms) between moving the mouse over a target and clicking.",
+            position = 15,
+            section = humanBehaviorSettings
+    )
+    default int hoverClickDelayMin() {
+        return 15; // sensible default
+    }
+
+    @ConfigItem(
+            keyName = "hoverClickDelayMax",
+            name = "Hover→Click Delay Max (ms)",
+            description = "Maximum delay (ms) between moving the mouse over a target and clicking.",
+            position = 16,
+            section = humanBehaviorSettings
+    )
+    default int hoverClickDelayMax() {
+        return 60; // sensible default
+    }
 
     @ConfigItem(
             keyName = "logHandling",
