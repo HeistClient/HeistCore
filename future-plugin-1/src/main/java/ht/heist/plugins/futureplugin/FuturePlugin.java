@@ -1,4 +1,4 @@
-package ht.heist;
+package ht.heist.plugins.futureplugin;
 
-public class Placeholder {
+public class FuturePlugin {
 }

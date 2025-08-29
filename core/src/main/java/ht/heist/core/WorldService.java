@@ -1,4 +1,4 @@
-package ht.heist;
+package ht.heist.core;
 
-public class Placeholder {
+public class WorldService {
 }

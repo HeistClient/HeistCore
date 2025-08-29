@@ -1,69 +1,22 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
                              http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
 
-    <!-- Inherit from the parent HeistCore POM -->
     <parent>
-        <groupId>ht.heist</groupId>
-        <artifactId>HeistCore</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
-        <relativePath>../pom.xml</relativePath>
+        <groupId>ht.heistcore</groupId>
+        <artifactId>heistcore</artifactId>
+        <version>1.0-SNAPSHOT</version>
     </parent>
 
+    <modelVersion>4.0.0</modelVersion>
     <artifactId>future-plugin-1</artifactId>
     <packaging>jar</packaging>
 
-    <properties>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
-        <runelite.version>1.11.16-SNAPSHOT</runelite.version>
-    </properties>
-
     <dependencies>
-        <!-- RuneLite client -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
-            <version>${runelite.version}</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <!-- RuneLite API -->
-        <dependency>
-            <groupId>net.runelite</groupId>
-            <artifactId>runelite-api</artifactId>
-            <version>${runelite.version}</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <!-- Lombok (optional, if used in plugin) -->
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <version>1.18.30</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <!-- Core module dependency -->
-        <dependency>
-            <groupId>ht.heist</groupId>
-            <artifactId>core</artifactId>
-            <version>1.0.0-SNAPSHOT</version>
         </dependency>
     </dependencies>
-
-    <build>
-        <plugins>
-            <!-- Optional: package as a jar -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-jar-plugin</artifactId>
-                <version>3.2.0</version>
-            </plugin>
-        </plugins>
-    </build>
 </project>
