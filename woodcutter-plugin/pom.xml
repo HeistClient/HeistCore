@@ -14,23 +14,17 @@
     <packaging>jar</packaging>
 
     <dependencies>
-        <!-- RuneLite client -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
-            <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- RuneLite API -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>runelite-api</artifactId>
-            <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
 
-        <!-- Lombok for @Slf4j -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -41,11 +35,10 @@
 
     <build>
         <plugins>
-            <!-- Shade plugin to build the final JAR -->
+            <!-- inherits version 3.5.0 from parent -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.2.4</version>
                 <executions>
                     <execution>
                         <phase>package</phase>
@@ -55,7 +48,6 @@
                         <configuration>
                             <shadedArtifactAttached>false</shadedArtifactAttached>
                             <transformers>
-                                <!-- Keep plugin.properties inside JAR -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
                                     <resource>plugin.properties</resource>
                                 </transformer>

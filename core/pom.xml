@@ -16,7 +16,13 @@
     <dependencies>
         <dependency>
             <groupId>net.runelite</groupId>
+            <artifactId>runelite-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 </project>
