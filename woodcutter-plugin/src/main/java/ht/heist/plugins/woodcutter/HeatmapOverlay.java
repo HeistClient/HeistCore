@@ -1,4 +1,4 @@
-package ht.heist;
+package ht.heist.plugins.woodcutter;
 
 import net.runelite.api.Client;
 import net.runelite.api.Point;

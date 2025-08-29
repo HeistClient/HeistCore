@@ -1,18 +1,20 @@
 package ht.heist.core;
 
+import ht.heist.core.impl.HumanizerServiceImpl;
+import ht.heist.core.impl.MouseServiceImpl;
 import ht.heist.core.services.*;
 
 public class CoreManager {
-    private final MouseService mouseService;
+    private final MouseServiceImpl mouseService;
     private final CameraService cameraService;
     private final WorldService worldService;
-    private final HumanizerService humanizerService;
+    private final HumanizerServiceImpl humanizerService;
     private final HeatmapService heatmapService;
 
-    public CoreManager(MouseService mouseService,
+    public CoreManager(MouseServiceImpl mouseService,
                        CameraService cameraService,
                        WorldService worldService,
-                       HumanizerService humanizerService,
+                       HumanizerServiceImpl humanizerService,
                        HeatmapService heatmapService) {
         this.mouseService = mouseService;
         this.cameraService = cameraService;
@@ -21,9 +23,9 @@ public class CoreManager {
         this.heatmapService = heatmapService;
     }
 
-public MouseService getMouseService() {return mouseService;}
+public MouseServiceImpl getMouseService() {return mouseService;}
 public CameraService getCameraService() {return cameraService;}
 public WorldService getWorldService() {return worldService;}
-public HumanizerService getHumanizerService() {return humanizerService;}
+public HumanizerServiceImpl getHumanizerService() {return humanizerService;}
 public HeatmapService getHeatmapService() {return heatmapService;}
 }
