@@ -1,5 +1,5 @@
 /**
- * WoodcutterPlugin*
+ * WoodcutterPlugin
  * Handles automated tree-chopping logic with human-like behavior.
  * Depends on MouseService + HumanizerService.
  */
@@ -27,7 +27,6 @@ import java.awt.Canvas;
 import java.awt.Rectangle;
 import java.awt.Shape;
 import java.awt.event.KeyEvent;
-import java.awt.event.MouseEvent;
 import java.util.*;
 
 @Slf4j
@@ -43,7 +42,7 @@ public class WoodcutterPlugin extends Plugin
     @Inject private OverlayManager overlayManager;
     @Inject private HeatmapOverlay heatmapOverlay;
 
-    // NEW: injected core services
+    // Injected core services
     @Inject private HumanizerService humanizer;
     @Inject private MouseService mouse;
 
@@ -124,7 +123,7 @@ public class WoodcutterPlugin extends Plugin
         return configManager.getConfig(WoodcutterConfig.class);
     }
 
-    // ADDED: This binds HeistCoreConfig so MouseServiceImpl (and other services) can inject it
+    // Bind HeistCoreConfig so MouseServiceImpl (and others) can inject it
     @Provides
     HeistCoreConfig provideHeistCoreConfig(ConfigManager configManager)
     {
@@ -148,7 +147,6 @@ public class WoodcutterPlugin extends Plugin
             return;
         }
 
-        // fatigue handled inside your HumanizerService (via sleep calls where needed)
         if (getEquippedAxeId() == -1)
         {
             log.error("No axe equipped. Stopping.");
@@ -491,12 +489,10 @@ public class WoodcutterPlugin extends Plugin
         net.runelite.api.Point p = Perspective.localToMinimap(client, lp);
         if (p != null)
         {
-            // draw heatmap
             if (config.drawHeatmap())
             {
                 heatmapOverlay.addPoint(new net.runelite.api.Point(p.getX(), p.getY()));
             }
-            // human click
             mouse.humanClick(new Rectangle(p.getX(), p.getY(), 1, 1), false);
         }
     }
@@ -655,7 +651,8 @@ public class WoodcutterPlugin extends Plugin
         }
         catch (Exception ignored)
         {
-            Thread.currentThread().interrupt();
+            // IMPORTANT: do not re-interrupt here.
+            // Re-interrupting will cause future sleeps to be skipped.
         }
     }
 }
