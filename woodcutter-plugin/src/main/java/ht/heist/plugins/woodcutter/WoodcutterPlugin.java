@@ -4,14 +4,15 @@
 // Purpose
 //   Thin woodcutting plugin that delegates input/timing to core services.
 //   - Red-click legacy behavior via MouseServiceImpl
-//   - Dynamic dropping: re-scan inventory each tick (no stale rects)
+//   - Inventory actions via InventoryService (dropOne per tick)
 //   - Natural drop order: always the first remaining log (top→down, left→right)
 //   - Heatmap shows ACTUAL click points via MouseServiceImpl tap hook
 //   - Uses HeistCoreConfig for waits (no dead plugin knobs)
 //
 // Requirements
 //   - Java 11 compatible
-//   - Depends on: HeistCoreConfig, MouseService, HumanizerService, WoodcutterConfig
+//   - Depends on: HeistCoreConfig, MouseService, HumanizerService,
+//                 InventoryService, WoodcutterConfig
 //   - WoodcutterConfig group id: "heistwoodcutter"
 // ============================================================================
 
@@ -25,6 +26,7 @@ import ht.heist.core.config.HeistCoreConfig;
 import ht.heist.core.impl.MouseServiceImpl;   // for heatmap tap hook
 import ht.heist.core.services.HumanizerService;
 import ht.heist.core.services.MouseService;
+import ht.heist.core.services.InventoryService;
 import lombok.extern.slf4j.Slf4j;
 
 import net.runelite.api.AnimationID;
@@ -79,13 +81,14 @@ public class WoodcutterPlugin extends Plugin
     // === Injected Services & Config =========================================
     // =========================================================================
     @Inject private Client client;
-    @Inject private WoodcutterConfig config;          // plugin knobs (tree type, log handling, overlay)
+    @Inject private WoodcutterConfig config;            // plugin knobs (tree type, log handling, overlay)
     @Inject private OverlayManager overlayManager;
     @Inject private HeatmapOverlay heatmapOverlay;
 
-    @Inject private HumanizerService humanizer;       // timing helpers
-    @Inject private MouseService mouse;               // core input (red-click)
-    @Inject private HeistCoreConfig coreCfg;          // shared core timings
+    @Inject private HumanizerService humanizer;         // timing helpers
+    @Inject private MouseService mouse;                 // core input (red-click)
+    @Inject private HeistCoreConfig coreCfg;            // shared core timings
+    @Inject private InventoryService inventory;         // NEW: inventory operations
 
     // =========================================================================
     // === State & Session Fields =============================================
@@ -308,13 +311,13 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- HANDLING_INVENTORY --------------------------------------------------
+    // --- HANDLING_INVENTORY (uses InventoryService) --------------------------
     private void handleInventoryState()
     {
-        if (!isInventoryOpen())
+        if (!inventory.isOpen())
         {
-            log.info("Opening inventory tab (ESC).");
-            dispatchKey(KeyEvent.VK_ESCAPE);
+            log.info("Opening inventory (InventoryService.open).");
+            inventory.open();
             setWait(coreCfg.reactionMeanMs(), coreCfg.reactionMeanMs() + 600);
             return;
         }
@@ -329,25 +332,18 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- DROPPING_LOGS (Natural: always first remaining log) -----------------
+    // --- DROPPING_LOGS (Natural: drop one per tick via InventoryService) -----
     private void handleDroppingState()
     {
-        // Re-scan inventory each tick and sort naturally (y, then x)
-        List<Widget> logsNow = currentLogWidgetsSortedNatural();
-        if (logsNow.isEmpty())
+        boolean dropped = inventory.dropOne(getLogIds());
+        if (dropped)
         {
-            log.info("No logs remain. Done dropping.");
-            setState(State.FINDING_TREE);
+            setWait(coreCfg.reactionMeanMs(), coreCfg.reactionMeanMs() + 120);
             return;
         }
 
-        // Always pick the first remaining log; yields natural L→R, top→down
-        Widget target = logsNow.get(0);
-        Rectangle r = target.getBounds();
-        log.info("Dropping log at {}", r);
-
-        clickRectHuman(r, true); // shift-drop
-        setWait(coreCfg.reactionMeanMs(), coreCfg.reactionMeanMs() + 100);
+        log.info("No logs remain. Done dropping.");
+        setState(State.FINDING_TREE);
     }
 
     // --- BURNING_LOGS --------------------------------------------------------
@@ -546,7 +542,7 @@ public class WoodcutterPlugin extends Plugin
         return null;
     }
 
-    // --- Inventory read helpers ---------------------------------------------
+    // --- Legacy direct widget reads (kept for firemaking path) ---------------
     private boolean isInventoryFull()
     {
         ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
@@ -577,28 +573,6 @@ public class WoodcutterPlugin extends Plugin
     private Widget getInventoryItem(int id)
     {
         return getInventoryItem(Collections.singletonList(id));
-    }
-
-    // --- Current logs (natural order) ---------------------------------------
-    private List<Widget> currentLogWidgetsSortedNatural()
-    {
-        Widget inv = client.getWidget(WidgetInfo.INVENTORY);
-        if (inv == null) return Collections.emptyList();
-
-        final Set<Integer> logIds = new HashSet<>(getLogIds());
-        List<Widget> items = new ArrayList<>();
-        for (Widget w : inv.getDynamicChildren())
-        {
-            if (w != null && logIds.contains(w.getItemId()))
-            {
-                items.add(w);
-            }
-        }
-        // Sort by row (y) then column (x). No “snaking”.
-        items.sort(Comparator
-                .comparingInt((Widget w) -> w.getBounds().y)
-                .thenComparingInt(w -> w.getBounds().x));
-        return items;
     }
 
     private List<Integer> getLogIds()

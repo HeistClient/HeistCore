@@ -7,16 +7,21 @@
 //       if you always click the same inventory slot repeatedly)
 //     • Optional overshoot + fatigue scaling
 //     • Optional heatmap tap hook to draw the ACTUAL click point
+//   NOW SINGLETON so every consumer (plugins + core services) shares the same
+//   instance, ensuring the heatmap tap listener covers all clicks.
 // ============================================================================
 
 package ht.heist.core.impl;
 
+// ===== Imports: core =====
 import ht.heist.core.config.HeistCoreConfig;
 import ht.heist.core.services.HumanizerService;
 import ht.heist.core.services.MouseService;
 import net.runelite.api.Client;
 
+// ===== Imports: JSR-330 / AWT / JDK =====
 import javax.inject.Inject;
+import javax.inject.Singleton;
 import java.awt.Canvas;
 import java.awt.Rectangle;
 import java.awt.Shape;
@@ -33,22 +38,26 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
+@Singleton
 public class MouseServiceImpl implements MouseService
 {
+    // --- Dependencies --------------------------------------------------------
     private final Client client;
     private final HumanizerService human;
     private final HeistCoreConfig cfg;
 
+    // --- Worker thread (legacy single-thread behavior) -----------------------
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "Heist-MouseService");
         t.setDaemon(true);
         return t;
     });
 
+    // --- Humanization state --------------------------------------------------
     private final Random rng = new Random();
     private final long sessionStartMs = System.currentTimeMillis();
 
-    // Per-bounds stratified cycle state
+    // --- Per-bounds stratified cycle state ----------------------------------
     private static final class ClickPattern {
         List<int[]> cells;  // each {cx, cy}, with cx,cy in [0..3]
         int idx = 0;
@@ -56,10 +65,11 @@ public class MouseServiceImpl implements MouseService
     }
     private final ConcurrentHashMap<Integer, ClickPattern> patternByBounds = new ConcurrentHashMap<>();
 
-    // Optional: external listener to tap into actual click point (for heatmap)
+    // --- Optional: external listener to tap actual click point (heatmap) -----
     private volatile Consumer<java.awt.Point> clickTapListener = null;
     public void setClickTapListener(Consumer<java.awt.Point> listener) { this.clickTapListener = listener; }
 
+    // --- Ctor ----------------------------------------------------------------
     @Inject
     public MouseServiceImpl(Client client, HumanizerService human, HeistCoreConfig cfg)
     {
@@ -68,6 +78,7 @@ public class MouseServiceImpl implements MouseService
         this.cfg = cfg;
     }
 
+    // === Public API ==========================================================
     @Override
     public void humanClick(Shape targetShape, boolean shift)
     {
@@ -100,6 +111,7 @@ public class MouseServiceImpl implements MouseService
         humanClick(new Rectangle(p.x, p.y, 1, 1), shift);
     }
 
+    // === Internals: Click task ==============================================
     private void dispatchClick(java.awt.Point target, boolean shift)
     {
         executor.submit(() -> {
@@ -160,6 +172,7 @@ public class MouseServiceImpl implements MouseService
         });
     }
 
+    // === Internals: Sampling =================================================
     private java.awt.Point pickPoint(Rectangle r)
     {
         final int key = Objects.hash(r.x, r.y, r.width, r.height);
@@ -211,6 +224,7 @@ public class MouseServiceImpl implements MouseService
         return new java.awt.Point(tgt.x + dx, tgt.y + dy);
     }
 
+    // === Internals: Humanization ============================================
     private int scaledGaussian(int mean, int std)
     {
         double base = Math.abs(rng.nextGaussian() * std + mean);
@@ -233,6 +247,7 @@ public class MouseServiceImpl implements MouseService
         return base * scale;
     }
 
+    // === Internals: AWT helper ==============================================
     private void dispatchMouse(Canvas canvas, int id, int x, int y, int button, int modifiersEx, int clickCount)
     {
         canvas.dispatchEvent(new MouseEvent(canvas, id, System.currentTimeMillis(), modifiersEx, x, y, clickCount, false, button));
