@@ -1,6 +1,14 @@
 // ============================================================================
 // WoodcutterConfig.java
 // -----------------------------------------------------------------------------
+// Purpose
+//   Plugin-specific knobs for the Heist Woodcutter.
+//   • Behavior: tree type, log handling
+//   • Overlay: heatmap toggle
+//   • Cursor Tracer (Bridge): mirrors core tracer settings so this plugin panel
+//     can control the core overlay via runtime sync.
+// Group ID must stay "heistwoodcutter" (plugin @Provides relies on it).
+// ============================================================================
 package ht.heist.plugins.woodcutter;
 
 import net.runelite.client.config.*;
@@ -50,7 +58,7 @@ public interface WoodcutterConfig extends Config
 
     enum LogHandling { DROP, BURN }
 
-    // ===== Section: Overlay =====
+    // ===== Section: Overlay ==================================================
     @ConfigSection(
             name = "Overlay",
             description = "Debug drawing / heatmap.",
@@ -66,4 +74,39 @@ public interface WoodcutterConfig extends Config
             section = overlay
     )
     default boolean drawHeatmap() { return true; }
+
+    // ===== Section: Cursor Tracer (Bridge to core) ===========================
+    @ConfigSection(
+            name = "Cursor Tracer (Core Bridge)",
+            description = "Controls the core cursor tracer overlay from this plugin.",
+            position = 20
+    )
+    String tracer = "tracer";
+
+    @ConfigItem(
+            keyName = "wcShowCursorTracer",
+            name = "Show cursor tracer",
+            description = "Enable core cursor tracer overlay (mirrors heistcore).",
+            position = 21,
+            section = tracer
+    )
+    default boolean wcShowCursorTracer() { return true; }
+
+    @ConfigItem(
+            keyName = "wcTracerTrailMs",
+            name = "Trail lifetime (ms)",
+            description = "How long each trail segment persists (mirrors heistcore).",
+            position = 22,
+            section = tracer
+    )
+    default int wcTracerTrailMs() { return 900; }
+
+    @ConfigItem(
+            keyName = "wcTracerRingRadiusPx",
+            name = "Ring radius (px)",
+            description = "Radius of the fake cursor ring (mirrors heistcore).",
+            position = 23,
+            section = tracer
+    )
+    default int wcTracerRingRadiusPx() { return 6; }
 }

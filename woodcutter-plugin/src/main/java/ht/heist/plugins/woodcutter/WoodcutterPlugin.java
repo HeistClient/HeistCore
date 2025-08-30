@@ -8,11 +8,13 @@
 //   - Natural drop order: always the first remaining log (top→down, left→right)
 //   - Heatmap shows ACTUAL click points via MouseServiceImpl tap hook
 //   - Uses HeistCoreConfig for waits (no dead plugin knobs)
+//   - NEW: Core Cursor Tracer overlay is controlled via a bridge: the
+//          Woodcutter panel mirrors tracer knobs and syncs them to heistcore.
 //
 // Requirements
 //   - Java 11 compatible
 //   - Depends on: HeistCoreConfig, MouseService, HumanizerService,
-//                 InventoryService, WoodcutterConfig
+//                 InventoryService, CursorTracerService, WoodcutterConfig
 //   - WoodcutterConfig group id: "heistwoodcutter"
 // ============================================================================
 
@@ -23,10 +25,11 @@ package ht.heist.plugins.woodcutter;
 // ============================================================================
 import com.google.inject.Provides;
 import ht.heist.core.config.HeistCoreConfig;
-import ht.heist.core.impl.MouseServiceImpl;   // for heatmap tap hook
+import ht.heist.core.impl.MouseServiceImpl;       // for heatmap tap hook
+import ht.heist.core.services.CursorTracerService;
 import ht.heist.core.services.HumanizerService;
-import ht.heist.core.services.MouseService;
 import ht.heist.core.services.InventoryService;
+import ht.heist.core.services.MouseService;
 import lombok.extern.slf4j.Slf4j;
 
 import net.runelite.api.AnimationID;
@@ -52,6 +55,7 @@ import net.runelite.api.widgets.WidgetInfo;
 
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
@@ -88,7 +92,9 @@ public class WoodcutterPlugin extends Plugin
     @Inject private HumanizerService humanizer;         // timing helpers
     @Inject private MouseService mouse;                 // core input (red-click)
     @Inject private HeistCoreConfig coreCfg;            // shared core timings
-    @Inject private InventoryService inventory;         // NEW: inventory operations
+    @Inject private InventoryService inventory;         // inventory operations
+    @Inject private CursorTracerService cursorTracer;   // core tracer manager
+    @Inject private ConfigManager configManager;        // <-- NEW: for tracer bridge
 
     // =========================================================================
     // === State & Session Fields =============================================
@@ -105,7 +111,6 @@ public class WoodcutterPlugin extends Plugin
     // =========================================================================
     // === Static Lookups / Constants =========================================
     // =========================================================================
-    // Axe animation lookup
     private static final Map<Integer, Integer> AXE_ANIMATION_MAP = new HashMap<>();
     static
     {
@@ -117,7 +122,6 @@ public class WoodcutterPlugin extends Plugin
         AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.RUNE_AXE,     AnimationID.WOODCUTTING_RUNE);
     }
 
-    // Firemaking bits (use raw ids to avoid RL constant mismatches)
     private static final int TINDERBOX_ID = net.runelite.api.ItemID.TINDERBOX;
     private static final int FIRE_OBJECT_ID = 26185; // was ObjectID.FIRE_26185
     private static final int FIREMAKING_ANIMATION_ID = AnimationID.FIREMAKING;
@@ -138,11 +142,15 @@ public class WoodcutterPlugin extends Plugin
     @Override
     protected void startUp()
     {
-        // --- Overlay on & clear ----------------------------------------------
+        // --- Overlays: heatmap + (core) cursor tracer ------------------------
         overlayManager.add(heatmapOverlay);
         heatmapOverlay.clearPoints();
 
-        // --- Wire heatmap to ACTUAL click points from MouseServiceImpl --------
+        // Mirror WC panel tracer knobs into core, then (re)enable core tracer
+        syncTracerBridgeToCore();          // <-- NEW
+        cursorTracer.enableIfConfigured(); // <-- NEW
+
+        // --- Wire heatmap to ACTUAL click points from MouseServiceImpl -------
         if (mouse instanceof MouseServiceImpl)
         {
             MouseServiceImpl impl = (MouseServiceImpl) mouse;
@@ -151,7 +159,7 @@ public class WoodcutterPlugin extends Plugin
             );
         }
 
-        // --- Boot state --------------------------------------------------------
+        // --- Boot state -------------------------------------------------------
         if (client.getGameState() == GameState.LOGGED_IN)
         {
             initializePluginState();
@@ -165,8 +173,43 @@ public class WoodcutterPlugin extends Plugin
     @Override
     protected void shutDown()
     {
+        cursorTracer.disable();               // remove tracer overlay
         overlayManager.remove(heatmapOverlay);
         log.info("Heist Woodcutter stopped.");
+    }
+
+    // =========================================================================
+    // === Live toggle / sync for tracer ======================================
+    // =========================================================================
+    @Subscribe
+    public void onConfigChanged(ConfigChanged e)
+    {
+        // Edits made in the Woodcutter panel: mirror to core, then refresh tracer
+        if ("heistwoodcutter".equals(e.getGroup()))
+        {
+            if ("showCursorTracer".equals(e.getKey())
+                    || "tracerTrailMs".equals(e.getKey())
+                    || "tracerRingRadiusPx".equals(e.getKey()))
+            {
+                syncTracerBridgeToCore();
+                cursorTracer.enableIfConfigured();
+            }
+            return;
+        }
+
+        // Edits made directly in the core panel (if opened): respect enable/disable
+        if ("heistcore".equals(e.getGroup()) && "showCursorTracer".equals(e.getKey()))
+        {
+            cursorTracer.enableIfConfigured();
+        }
+    }
+
+    // Bridge Woodcutter panel tracer settings -> heistcore group for core overlay
+    private void syncTracerBridgeToCore()
+    {
+        configManager.setConfiguration("heistcore", "showCursorTracer", Boolean.toString(config.wcShowCursorTracer()));
+        configManager.setConfiguration("heistcore", "tracerTrailMs", Integer.toString(config.wcTracerTrailMs()));
+        configManager.setConfiguration("heistcore", "tracerRingRadiusPx", Integer.toString(config.wcTracerRingRadiusPx()));
     }
 
     // =========================================================================
@@ -196,7 +239,7 @@ public class WoodcutterPlugin extends Plugin
             return;
         }
 
-        // --- Guard: has axe ----------------------------------------------------
+        // Guard: has axe
         if (getEquippedAxeId() == -1)
         {
             log.error("No axe equipped. Stopping.");
@@ -204,7 +247,7 @@ public class WoodcutterPlugin extends Plugin
             return;
         }
 
-        // --- Only enter handling when NOT already handling --------------------
+        // Only enter handling when NOT already handling
         if (isInventoryFull() && isNotHandlingInventory())
         {
             log.info("Inventory is full. Switching to HANDLE_INVENTORY state.");
@@ -239,7 +282,6 @@ public class WoodcutterPlugin extends Plugin
     // === State Handlers ======================================================
     // =========================================================================
 
-    // --- FINDING_TREE --------------------------------------------------------
     private void handleFindingTreeState()
     {
         if (isPlayerBusy()) return;
@@ -258,7 +300,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- WALKING_TO_TREE -----------------------------------------------------
     private void handleWalkingState()
     {
         if (client.getLocalPlayer().getAnimation() == getEquippedAxeAnimation())
@@ -276,7 +317,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- VERIFYING_CHOP_START ------------------------------------------------
     private void handleVerifyChopStartState()
     {
         if (client.getLocalPlayer().getAnimation() == getEquippedAxeAnimation())
@@ -300,7 +340,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- CHOPPING ------------------------------------------------------------
     private void handleChoppingState()
     {
         if (client.getLocalPlayer().getAnimation() != getEquippedAxeAnimation())
@@ -311,7 +350,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- HANDLING_INVENTORY (uses InventoryService) --------------------------
     private void handleInventoryState()
     {
         if (!inventory.isOpen())
@@ -332,7 +370,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- DROPPING_LOGS (Natural: drop one per tick via InventoryService) -----
     private void handleDroppingState()
     {
         boolean dropped = inventory.dropOne(getLogIds());
@@ -346,7 +383,6 @@ public class WoodcutterPlugin extends Plugin
         setState(State.FINDING_TREE);
     }
 
-    // --- BURNING_LOGS --------------------------------------------------------
     private void handleBurningState()
     {
         if (isStandingOnFireByIteration(client.getLocalPlayer().getWorldLocation()))
@@ -376,7 +412,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- MOVING_TO_SAFE_TILE -------------------------------------------------
     private void handleMovingToSafeTileState()
     {
         if (!isPlayerMoving())
@@ -400,7 +435,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- VERIFYING_FIREMAKING_START -----------------------------------------
     private void handleVerifyFiremakingState()
     {
         if (client.getLocalPlayer().getAnimation() == FIREMAKING_ANIMATION_ID)
@@ -415,7 +449,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- WAITING_FOR_FIRE_TO_BURN -------------------------------------------
     private void handleWaitingForFireState()
     {
         if (client.getLocalPlayer().getAnimation() != FIREMAKING_ANIMATION_ID)
@@ -426,7 +459,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- RECOVERING ----------------------------------------------------------
     private void handleRecoveryState()
     {
         if (startLocation != null
@@ -443,7 +475,6 @@ public class WoodcutterPlugin extends Plugin
     // === Helpers: Targeting / Scene / Inventory =============================
     // =========================================================================
 
-    // --- Startup init --------------------------------------------------------
     private void initializePluginState()
     {
         final Player local = client.getLocalPlayer();
@@ -459,7 +490,6 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // --- Find nearest tree by scene scan ------------------------------------
     private GameObject findNearestTreeByIteration()
     {
         cleanBlacklist();
@@ -498,7 +528,6 @@ public class WoodcutterPlugin extends Plugin
                 .orElse(null);
     }
 
-    // --- Fire detection on current tile -------------------------------------
     private boolean isStandingOnFireByIteration(WorldPoint loc)
     {
         LocalPoint lp = LocalPoint.fromWorld(client, loc);
@@ -511,7 +540,6 @@ public class WoodcutterPlugin extends Plugin
                 .anyMatch(o -> o != null && o.getId() == FIRE_OBJECT_ID);
     }
 
-    // --- Find nearby safe tile ----------------------------------------------
     private WorldPoint findSafeNearbyTile(WorldPoint center)
     {
         Player local = client.getLocalPlayer();
@@ -542,7 +570,7 @@ public class WoodcutterPlugin extends Plugin
         return null;
     }
 
-    // --- Legacy direct widget reads (kept for firemaking path) ---------------
+    // Legacy direct widget reads (kept for firemaking path)
     private boolean isInventoryFull()
     {
         ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
@@ -593,8 +621,6 @@ public class WoodcutterPlugin extends Plugin
     // =========================================================================
     // === Helpers: State / Wait / Blacklist / Input ==========================
     // =========================================================================
-
-    // --- Inventory state guard (prevents re-entering while handling) ----------
     private boolean isNotHandlingInventory()
     {
         return currentState != State.HANDLING_INVENTORY
@@ -639,7 +665,6 @@ public class WoodcutterPlugin extends Plugin
         blacklist.entrySet().removeIf(e -> now > e.getValue());
     }
 
-    // --- Minimap click (uses core mouse) ------------------------------------
     private void clickOnMinimap(WorldPoint target)
     {
         LocalPoint lp = LocalPoint.fromWorld(client, target);
@@ -649,7 +674,6 @@ public class WoodcutterPlugin extends Plugin
         if (p != null) mouse.humanClick(new Rectangle(p.getX(), p.getY(), 1, 1), false);
     }
 
-    // --- Input helpers (clicks & keys) --------------------------------------
     private void clickShapeHuman(Shape shape, boolean shift)
     {
         if (shape == null) return;
@@ -678,7 +702,6 @@ public class WoodcutterPlugin extends Plugin
         catch (Exception ignored) { /* don't re-interrupt */ }
     }
 
-    // --- Player / Axe helpers ------------------------------------------------
     private int getEquippedAxeId()
     {
         ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);

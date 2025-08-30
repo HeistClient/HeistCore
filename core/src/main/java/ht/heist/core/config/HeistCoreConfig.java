@@ -2,11 +2,15 @@
 // HeistCoreConfig.java
 // -----------------------------------------------------------------------------
 // Purpose
-//   Minimal, live knobs used by MouseServiceImpl. Old/unused options removed.
-//   - Move pause (tiny settle after MOVE)
-//   - Press/hold window
-//   - Reaction delay (MOVE -> PRESS)
-//   - Optional human touches: overshoot + fatigue
+//   Global core config used by MouseServiceImpl, CameraServiceImpl, and
+//   core UI overlays (e.g., CursorTracerOverlay).
+//   - Mouse timing: tiny settle after MOVE, press/hold, reaction delay
+//   - Human touches: overshoot / fatigue
+//   - Cursor Tracer (global): fake cursor ring + fading trail
+//
+// Notes
+//   • Config group id stays "heistcore" (plugins @Provides should match).
+//   • Positions are spaced so future options can slot in easily.
 // ============================================================================
 
 package ht.heist.core.config;
@@ -20,7 +24,7 @@ import net.runelite.client.config.ConfigSection;
 public interface HeistCoreConfig extends Config
 {
     // ========================================================================
-    // Section: Mouse Timing
+    // === Section: Mouse Timing ==============================================
     // ========================================================================
     @ConfigSection(
             name = "Mouse Timing",
@@ -29,6 +33,7 @@ public interface HeistCoreConfig extends Config
     )
     String mouseTiming = "mouseTiming";
 
+    // -- Tiny settle after MOVE (used by MouseServiceImpl) --------------------
     @ConfigItem(
             keyName = "canvasMoveSleepMinMs",
             name = "Move pause min (ms)",
@@ -45,6 +50,7 @@ public interface HeistCoreConfig extends Config
     )
     default int canvasMoveSleepMaxMs() { return 30; }
 
+    // -- Press/hold window ----------------------------------------------------
     @ConfigItem(
             keyName = "pressHoldMinMs",
             name = "Press hold min (ms)",
@@ -61,6 +67,7 @@ public interface HeistCoreConfig extends Config
     )
     default int pressHoldMaxMs() { return 55; }
 
+    // -- Reaction (MOVE → PRESS) ---------------------------------------------
     @ConfigItem(
             keyName = "reactionMeanMs",
             name = "Reaction mean (ms)",
@@ -78,7 +85,7 @@ public interface HeistCoreConfig extends Config
     default int reactionStdMs() { return 40; }
 
     // ========================================================================
-    // Section: Human Touches
+    // === Section: Human Touches =============================================
     // ========================================================================
     @ConfigSection(
             name = "Human Touches",
@@ -87,6 +94,7 @@ public interface HeistCoreConfig extends Config
     )
     String human = "human";
 
+    // -- Overshoot ------------------------------------------------------------
     @ConfigItem(
             keyName = "enableOvershoot",
             name = "Enable overshoot",
@@ -103,6 +111,7 @@ public interface HeistCoreConfig extends Config
     )
     default int overshootChancePct() { return 12; } // ~1 in 8
 
+    // -- Fatigue --------------------------------------------------------------
     @ConfigItem(
             keyName = "enableFatigue",
             name = "Enable fatigue",
@@ -118,4 +127,41 @@ public interface HeistCoreConfig extends Config
             position = 14, section = human
     )
     default int fatigueMaxPct() { return 20; } // up to +20%
+
+    // ========================================================================
+    // === Section: Cursor Tracer (GLOBAL) ====================================
+    // ========================================================================
+    @ConfigSection(
+            name = "Cursor Tracer",
+            description = "Global fake cursor ring + fading trail (core overlay).",
+            position = 90
+    )
+    String cursorTracer = "cursorTracer";
+
+    // -- Master toggle --------------------------------------------------------
+    @ConfigItem(
+            keyName = "showCursorTracer",
+            name = "Show cursor tracer",
+            description = "Draw a fake cursor ring with a fading trail.",
+            position = 91, section = cursorTracer
+    )
+    default boolean showCursorTracer() { return true; }
+
+    // -- Trail lifetime -------------------------------------------------------
+    @ConfigItem(
+            keyName = "tracerTrailMs",
+            name = "Trail lifetime (ms)",
+            description = "How long each tail segment persists before fading out.",
+            position = 92, section = cursorTracer
+    )
+    default int tracerTrailMs() { return 900; }
+
+    // -- Ring radius ----------------------------------------------------------
+    @ConfigItem(
+            keyName = "tracerRingRadiusPx",
+            name = "Ring radius (px)",
+            description = "Radius of the fake cursor ring drawn at the mouse.",
+            position = 93, section = cursorTracer
+    )
+    default int tracerRingRadiusPx() { return 6; }
 }
