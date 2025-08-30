@@ -109,4 +109,78 @@ public interface WoodcutterConfig extends Config
             section = tracer
     )
     default int wcTracerRingRadiusPx() { return 6; }
+
+    // ===== Section: Heatmap Bridge (to core) =====
+    @ConfigSection(
+            name = "Heatmap",
+            description = "Mirrors to core heatmap settings.",
+            position = 20
+    )
+    String heatmap = "heatmap";
+
+    @ConfigItem(
+            keyName = "wcShowHeatmap",
+            name = "Show heatmap",
+            description = "Mirror to core showHeatmap.",
+            position = 21, section = heatmap
+    )
+    default boolean wcShowHeatmap() { return true; }
+
+    @ConfigItem(
+            keyName = "wcHeatmapFadeMs",
+            name = "Dot fade (ms)",
+            description = "0 = never fade. Mirrors to core heatmapFadeMs.",
+            position = 22, section = heatmap
+    )
+    default int wcHeatmapFadeMs() { return 0; } // <- no fade by default
+
+    @ConfigItem(
+            keyName = "wcHeatmapDotRadiusPx",
+            name = "Dot radius (px)",
+            description = "0 = single pixel. Mirrors to core heatmapDotRadiusPx.",
+            position = 23, section = heatmap
+    )
+    default int wcHeatmapDotRadiusPx() { return 0; } // <- 1px
+
+    @ConfigItem(
+            keyName = "wcHeatmapMaxPoints",
+            name = "Max dots",
+            description = "Mirror to core heatmapMaxPoints.",
+            position = 24, section = heatmap
+    )
+    default int wcHeatmapMaxPoints() { return 2000; }
+
+    enum WcHeatmapColorMode { MONO, HOT_COLD }
+
+    @ConfigItem(
+            keyName = "wcHeatmapColorMode",
+            name = "Color mode",
+            description = "MONO or HOT_COLD. Mirrors to core heatmapColorMode.",
+            position = 25, section = heatmap
+    )
+    default WcHeatmapColorMode wcHeatmapColorMode() { return WcHeatmapColorMode.HOT_COLD; }
+
+    @ConfigItem(
+            keyName = "wcHeatmapExportEnabled",
+            name = "Enable periodic export",
+            description = "Mirror to core heatmapExportEnabled.",
+            position = 26, section = heatmap
+    )
+    default boolean wcHeatmapExportEnabled() { return false; }
+
+    @ConfigItem(
+            keyName = "wcHeatmapExportEveryMs",
+            name = "Export interval (ms)",
+            description = "Mirror to core heatmapExportEveryMs.",
+            position = 27, section = heatmap
+    )
+    default int wcHeatmapExportEveryMs() { return 15000; }
+
+    @ConfigItem(
+            keyName = "wcHeatmapExportFolder",
+            name = "Export folder",
+            description = "Mirror to core heatmapExportFolder.",
+            position = 28, section = heatmap
+    )
+    default String wcHeatmapExportFolder() { return "heist-heatmaps"; }
 }

@@ -6,32 +6,27 @@
 //   - Red-click legacy behavior via MouseServiceImpl
 //   - Inventory actions via InventoryService (dropOne per tick)
 //   - Natural drop order: always the first remaining log (top→down, left→right)
-//   - Heatmap shows ACTUAL click points via MouseServiceImpl tap hook
+//   - Heatmap handled by CORE HeatmapService (+ CoreHeatmapOverlay)
+//   - Cursor tracer handled by CORE CursorTracerService
 //   - Uses HeistCoreConfig for waits (no dead plugin knobs)
-//   - NEW: Core Cursor Tracer overlay is controlled via a bridge: the
-//          Woodcutter panel mirrors tracer knobs and syncs them to heistcore.
-//
-// Requirements
-//   - Java 11 compatible
-//   - Depends on: HeistCoreConfig, MouseService, HumanizerService,
-//                 InventoryService, CursorTracerService, WoodcutterConfig
-//   - WoodcutterConfig group id: "heistwoodcutter"
+//   - Mirrors Woodcutter heatmap/tracer knobs into heistcore so core overlays
+//     behave consistently without opening two config panes.
 // ============================================================================
 
 package ht.heist.plugins.woodcutter;
 
-// ============================================================================
-// Imports: Core & RuneLite
-// ============================================================================
 import com.google.inject.Provides;
 import ht.heist.core.config.HeistCoreConfig;
-import ht.heist.core.impl.MouseServiceImpl;       // for heatmap tap hook
+import ht.heist.core.impl.CursorTracerServiceImpl;
+import ht.heist.core.impl.HeatmapServiceImpl;
+import ht.heist.core.impl.MouseServiceImpl;
 import ht.heist.core.services.CursorTracerService;
+import ht.heist.core.services.HeatmapService;
 import ht.heist.core.services.HumanizerService;
 import ht.heist.core.services.InventoryService;
 import ht.heist.core.services.MouseService;
+import ht.heist.core.ui.CoreHeatmapOverlay;
 import lombok.extern.slf4j.Slf4j;
-
 import net.runelite.api.AnimationID;
 import net.runelite.api.Client;
 import net.runelite.api.CollisionData;
@@ -52,7 +47,6 @@ import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
-
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
@@ -60,9 +54,6 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
 
-// ============================================================================
-// Imports: JDK
-// ============================================================================
 import javax.inject.Inject;
 import java.awt.Canvas;
 import java.awt.Rectangle;
@@ -70,9 +61,6 @@ import java.awt.Shape;
 import java.awt.event.KeyEvent;
 import java.util.*;
 
-// ============================================================================
-// @PluginDescriptor
-// ============================================================================
 @Slf4j
 @PluginDescriptor(
         name = "Heist Woodcutter",
@@ -81,24 +69,22 @@ import java.util.*;
 )
 public class WoodcutterPlugin extends Plugin
 {
-    // =========================================================================
-    // === Injected Services & Config =========================================
-    // =========================================================================
+    // === Injected services & config =========================================
     @Inject private Client client;
-    @Inject private WoodcutterConfig config;            // plugin knobs (tree type, log handling, overlay)
+    @Inject private WoodcutterConfig config;
+    @Inject private HumanizerService humanizer;
+    @Inject private MouseService mouse;
+    @Inject private HeistCoreConfig coreCfg;
+    @Inject private InventoryService inventory;
+    @Inject private CursorTracerService cursorTracer;
+    @Inject private HeatmapService heatmap;
+    @Inject private ConfigManager configManager;
+
+    // Overlays
     @Inject private OverlayManager overlayManager;
-    @Inject private HeatmapOverlay heatmapOverlay;
+    @Inject private CoreHeatmapOverlay coreHeatmapOverlay;
 
-    @Inject private HumanizerService humanizer;         // timing helpers
-    @Inject private MouseService mouse;                 // core input (red-click)
-    @Inject private HeistCoreConfig coreCfg;            // shared core timings
-    @Inject private InventoryService inventory;         // inventory operations
-    @Inject private CursorTracerService cursorTracer;   // core tracer manager
-    @Inject private ConfigManager configManager;        // <-- NEW: for tracer bridge
-
-    // =========================================================================
-    // === State & Session Fields =============================================
-    // =========================================================================
+    // === State & session =====================================================
     private State currentState;
     private long stateTimeout = 0L;
     private long nextActionTime = 0L;
@@ -108,9 +94,7 @@ public class WoodcutterPlugin extends Plugin
     private final Map<WorldPoint, Long> blacklist = new HashMap<>();
     private static final long BLACKLIST_DURATION_MS = 10_000;
 
-    // =========================================================================
-    // === Static Lookups / Constants =========================================
-    // =========================================================================
+    // Axe animation lookup
     private static final Map<Integer, Integer> AXE_ANIMATION_MAP = new HashMap<>();
     static
     {
@@ -122,13 +106,11 @@ public class WoodcutterPlugin extends Plugin
         AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.RUNE_AXE,     AnimationID.WOODCUTTING_RUNE);
     }
 
+    // Firemaking bits (raw ids)
     private static final int TINDERBOX_ID = net.runelite.api.ItemID.TINDERBOX;
-    private static final int FIRE_OBJECT_ID = 26185; // was ObjectID.FIRE_26185
+    private static final int FIRE_OBJECT_ID = 26185; // ObjectID.FIRE_26185
     private static final int FIREMAKING_ANIMATION_ID = AnimationID.FIREMAKING;
 
-    // =========================================================================
-    // === Enum: High-level State Machine =====================================
-    // =========================================================================
     private enum State
     {
         STARTING, IDLE, FINDING_TREE, WALKING_TO_TREE, VERIFYING_CHOP_START, CHOPPING,
@@ -136,30 +118,29 @@ public class WoodcutterPlugin extends Plugin
         WAITING_FOR_FIRE_TO_BURN, MOVING_TO_SAFE_TILE, RECOVERING
     }
 
-    // =========================================================================
-    // === Lifecycle: startUp / shutDown ======================================
-    // =========================================================================
+    // === Lifecycle ===========================================================
     @Override
     protected void startUp()
     {
-        // --- Overlays: heatmap + (core) cursor tracer ------------------------
-        overlayManager.add(heatmapOverlay);
-        heatmapOverlay.clearPoints();
+        // Mirror WC panels -> core (so core overlays follow this plugin's knobs)
+        syncTracerBridgeToCore();
+        syncHeatmapBridgeToCore();
 
-        // Mirror WC panel tracer knobs into core, then (re)enable core tracer
-        syncTracerBridgeToCore();          // <-- NEW
-        cursorTracer.enableIfConfigured(); // <-- NEW
+        // Add core heatmap overlay so it can render
+        overlayManager.add(coreHeatmapOverlay);
 
-        // --- Wire heatmap to ACTUAL click points from MouseServiceImpl -------
+        // Enable core overlays per heistcore config
+        heatmap.enableIfConfigured();
+        cursorTracer.enableIfConfigured();
+
+        // Wire ACTUAL click points -> core heatmap service
         if (mouse instanceof MouseServiceImpl)
         {
-            MouseServiceImpl impl = (MouseServiceImpl) mouse;
-            impl.setClickTapListener(p ->
-                    heatmapOverlay.addPoint(new net.runelite.api.Point(p.x, p.y))
-            );
+            ((MouseServiceImpl) mouse).setClickTapListener(p ->
+                    heatmap.addClick(p.x, p.y));
         }
 
-        // --- Boot state -------------------------------------------------------
+        // Boot state
         if (client.getGameState() == GameState.LOGGED_IN)
         {
             initializePluginState();
@@ -173,18 +154,17 @@ public class WoodcutterPlugin extends Plugin
     @Override
     protected void shutDown()
     {
-        cursorTracer.disable();               // remove tracer overlay
-        overlayManager.remove(heatmapOverlay);
+        overlayManager.remove(coreHeatmapOverlay);
+        cursorTracer.disable();
+        heatmap.disable();
         log.info("Heist Woodcutter stopped.");
     }
 
-    // =========================================================================
-    // === Live toggle / sync for tracer ======================================
-    // =========================================================================
+    // === Live toggle for core overlays ======================================
     @Subscribe
     public void onConfigChanged(ConfigChanged e)
     {
-        // Edits made in the Woodcutter panel: mirror to core, then refresh tracer
+        // Edits in Woodcutter panel: mirror to core and refresh overlays
         if ("heistwoodcutter".equals(e.getGroup()))
         {
             if ("showCursorTracer".equals(e.getKey())
@@ -193,37 +173,86 @@ public class WoodcutterPlugin extends Plugin
             {
                 syncTracerBridgeToCore();
                 cursorTracer.enableIfConfigured();
+                return;
             }
-            return;
+
+            if (e.getKey().startsWith("wcHeatmap"))
+            {
+                syncHeatmapBridgeToCore();
+                heatmap.enableIfConfigured();
+                return;
+            }
         }
 
-        // Edits made directly in the core panel (if opened): respect enable/disable
-        if ("heistcore".equals(e.getGroup()) && "showCursorTracer".equals(e.getKey()))
+        // Edits in the core panel itself (if opened): respect enable/disable
+        if ("heistcore".equals(e.getGroup()))
         {
-            cursorTracer.enableIfConfigured();
+            if ("showCursorTracer".equals(e.getKey()))
+            {
+                cursorTracer.enableIfConfigured();
+            }
+            if ("showHeatmap".equals(e.getKey()))
+            {
+                heatmap.enableIfConfigured();
+            }
         }
     }
 
-    // Bridge Woodcutter panel tracer settings -> heistcore group for core overlay
+    // ----- cursor tracer bridge (WC -> core) -----
     private void syncTracerBridgeToCore()
     {
-        configManager.setConfiguration("heistcore", "showCursorTracer", Boolean.toString(config.wcShowCursorTracer()));
-        configManager.setConfiguration("heistcore", "tracerTrailMs", Integer.toString(config.wcTracerTrailMs()));
-        configManager.setConfiguration("heistcore", "tracerRingRadiusPx", Integer.toString(config.wcTracerRingRadiusPx()));
+        configManager.setConfiguration("heistcore", "showCursorTracer",
+                Boolean.toString(config.wcShowCursorTracer()));
+        configManager.setConfiguration("heistcore", "tracerTrailMs",
+                Integer.toString(config.wcTracerTrailMs()));
+        configManager.setConfiguration("heistcore", "tracerRingRadiusPx",
+                Integer.toString(config.wcTracerRingRadiusPx()));
     }
 
-    // =========================================================================
-    // === DI Providers (Guice) ================================================
-    // =========================================================================
+    // ----- heatmap bridge (WC -> core) -----
+    private void syncHeatmapBridgeToCore()
+    {
+        // Show/Hide
+        configManager.setConfiguration("heistcore", "showHeatmap",
+                Boolean.toString(config.wcShowHeatmap()));
+
+        // Visuals
+        configManager.setConfiguration("heistcore", "heatmapFadeMs",
+                Integer.toString(config.wcHeatmapFadeMs()));               // 0 = no fade
+        configManager.setConfiguration("heistcore", "heatmapDotRadiusPx",
+                Integer.toString(config.wcHeatmapDotRadiusPx()));          // 0 = 1px
+        configManager.setConfiguration("heistcore", "heatmapMaxPoints",
+                Integer.toString(config.wcHeatmapMaxPoints()));
+
+        // Color mode
+        String mode = (config.wcHeatmapColorMode() == WoodcutterConfig.WcHeatmapColorMode.HOT_COLD)
+                ? "HOT_COLD" : "MONO";
+        configManager.setConfiguration("heistcore", "heatmapColorMode", mode);
+
+        // Export
+        configManager.setConfiguration("heistcore", "heatmapExportEnabled",
+                Boolean.toString(config.wcHeatmapExportEnabled()));
+        configManager.setConfiguration("heistcore", "heatmapExportEveryMs",
+                Integer.toString(config.wcHeatmapExportEveryMs()));
+        configManager.setConfiguration("heistcore", "heatmapExportFolder",
+                config.wcHeatmapExportFolder());
+    }
+
+    // === DI providers (bind interface -> impl so Guice can inject) ==========
     @Provides
     WoodcutterConfig provideConfig(ConfigManager cm) { return cm.getConfig(WoodcutterConfig.class); }
 
     @Provides
     HeistCoreConfig provideHeistCoreConfig(ConfigManager cm) { return cm.getConfig(HeistCoreConfig.class); }
 
-    // =========================================================================
-    // === Tick Loop & State Runner ===========================================
-    // =========================================================================
+    // Bind interfaces to concrete impls from core (since core is a plain lib jar)
+    @Provides
+    HeatmapService provideHeatmapService(HeatmapServiceImpl impl) { return impl; }
+
+    @Provides
+    CursorTracerService provideCursorTracerService(CursorTracerServiceImpl impl) { return impl; }
+
+    // === Tick loop ===========================================================
     @Subscribe
     public void onGameTick(GameTick event)
     {
@@ -239,7 +268,6 @@ public class WoodcutterPlugin extends Plugin
             return;
         }
 
-        // Guard: has axe
         if (getEquippedAxeId() == -1)
         {
             log.error("No axe equipped. Stopping.");
@@ -247,7 +275,6 @@ public class WoodcutterPlugin extends Plugin
             return;
         }
 
-        // Only enter handling when NOT already handling
         if (isInventoryFull() && isNotHandlingInventory())
         {
             log.info("Inventory is full. Switching to HANDLE_INVENTORY state.");
@@ -278,15 +305,13 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    // =========================================================================
-    // === State Handlers ======================================================
-    // =========================================================================
-
+    // === State handlers ======================================================
     private void handleFindingTreeState()
     {
         if (isPlayerBusy()) return;
 
-        currentTarget = findNearestTreeByIteration();
+        GameObject target = findNearestTreeByIteration();
+        currentTarget = target;
         if (currentTarget != null)
         {
             log.info("Found tree at {}. Interacting.", currentTarget.getWorldLocation());
@@ -471,10 +496,7 @@ public class WoodcutterPlugin extends Plugin
         setState(State.FINDING_TREE);
     }
 
-    // =========================================================================
-    // === Helpers: Targeting / Scene / Inventory =============================
-    // =========================================================================
-
+    // === Helpers: targeting / scene / inventory =============================
     private void initializePluginState()
     {
         final Player local = client.getLocalPlayer();
@@ -618,9 +640,7 @@ public class WoodcutterPlugin extends Plugin
         return config.treeType() == WoodcutterConfig.TreeType.OAK ? "Oak log" : "log";
     }
 
-    // =========================================================================
-    // === Helpers: State / Wait / Blacklist / Input ==========================
-    // =========================================================================
+    // === Helpers: state / wait / blacklist / input ==========================
     private boolean isNotHandlingInventory()
     {
         return currentState != State.HANDLING_INVENTORY
@@ -677,13 +697,13 @@ public class WoodcutterPlugin extends Plugin
     private void clickShapeHuman(Shape shape, boolean shift)
     {
         if (shape == null) return;
-        mouse.humanClick(shape, shift);   // heatmap is fed by MouseServiceImpl hook
+        mouse.humanClick(shape, shift);   // MouseServiceImpl tap -> HeatmapService.addClick
     }
 
     private void clickRectHuman(Rectangle rect, boolean shift)
     {
         if (rect == null) return;
-        mouse.humanClick(rect, shift);    // heatmap is fed by MouseServiceImpl hook
+        mouse.humanClick(rect, shift);    // MouseServiceImpl tap -> HeatmapService.addClick
     }
 
     private void dispatchKey(int keyCode)
@@ -724,7 +744,7 @@ public class WoodcutterPlugin extends Plugin
     private boolean isPlayerBusy()
     {
         Player local = client.getLocalPlayer();
-        if (local == null) return true; // safe default until logged in
+        if (local == null) return true; // safe until logged in
         return local.getAnimation() != -1 || isPlayerMoving() || local.getInteracting() != null;
     }
 }

@@ -3,14 +3,11 @@
 // -----------------------------------------------------------------------------
 // Purpose
 //   Global core config used by MouseServiceImpl, CameraServiceImpl, and
-//   core UI overlays (e.g., CursorTracerOverlay).
+//   core UI overlays (CursorTracerOverlay, CoreHeatmapOverlay).
 //   - Mouse timing: tiny settle after MOVE, press/hold, reaction delay
 //   - Human touches: overshoot / fatigue
 //   - Cursor Tracer (global): fake cursor ring + fading trail
-//
-// Notes
-//   • Config group id stays "heistcore" (plugins @Provides should match).
-//   • Positions are spaced so future options can slot in easily.
+//   - Heatmap (global): tiny dots, hot/cold color mode, optional periodic export
 // ============================================================================
 
 package ht.heist.core.config;
@@ -33,7 +30,6 @@ public interface HeistCoreConfig extends Config
     )
     String mouseTiming = "mouseTiming";
 
-    // -- Tiny settle after MOVE (used by MouseServiceImpl) --------------------
     @ConfigItem(
             keyName = "canvasMoveSleepMinMs",
             name = "Move pause min (ms)",
@@ -50,7 +46,6 @@ public interface HeistCoreConfig extends Config
     )
     default int canvasMoveSleepMaxMs() { return 30; }
 
-    // -- Press/hold window ----------------------------------------------------
     @ConfigItem(
             keyName = "pressHoldMinMs",
             name = "Press hold min (ms)",
@@ -67,7 +62,6 @@ public interface HeistCoreConfig extends Config
     )
     default int pressHoldMaxMs() { return 55; }
 
-    // -- Reaction (MOVE → PRESS) ---------------------------------------------
     @ConfigItem(
             keyName = "reactionMeanMs",
             name = "Reaction mean (ms)",
@@ -94,7 +88,6 @@ public interface HeistCoreConfig extends Config
     )
     String human = "human";
 
-    // -- Overshoot ------------------------------------------------------------
     @ConfigItem(
             keyName = "enableOvershoot",
             name = "Enable overshoot",
@@ -111,7 +104,6 @@ public interface HeistCoreConfig extends Config
     )
     default int overshootChancePct() { return 12; } // ~1 in 8
 
-    // -- Fatigue --------------------------------------------------------------
     @ConfigItem(
             keyName = "enableFatigue",
             name = "Enable fatigue",
@@ -138,7 +130,6 @@ public interface HeistCoreConfig extends Config
     )
     String cursorTracer = "cursorTracer";
 
-    // -- Master toggle --------------------------------------------------------
     @ConfigItem(
             keyName = "showCursorTracer",
             name = "Show cursor tracer",
@@ -147,7 +138,6 @@ public interface HeistCoreConfig extends Config
     )
     default boolean showCursorTracer() { return true; }
 
-    // -- Trail lifetime -------------------------------------------------------
     @ConfigItem(
             keyName = "tracerTrailMs",
             name = "Trail lifetime (ms)",
@@ -156,7 +146,6 @@ public interface HeistCoreConfig extends Config
     )
     default int tracerTrailMs() { return 900; }
 
-    // -- Ring radius ----------------------------------------------------------
     @ConfigItem(
             keyName = "tracerRingRadiusPx",
             name = "Ring radius (px)",
@@ -164,4 +153,127 @@ public interface HeistCoreConfig extends Config
             position = 93, section = cursorTracer
     )
     default int tracerRingRadiusPx() { return 6; }
+
+    // ========================================================================
+    // === Section: Heatmap (GLOBAL) ==========================================
+    // ========================================================================
+    @ConfigSection(
+            name = "Heatmap",
+            description = "Global click heatmap (core overlay).",
+            position = 95
+    )
+    String heatmap = "heatmap";
+
+    // Master toggle
+    @ConfigItem(
+            keyName = "showHeatmap",
+            name = "Show click heatmap",
+            description = "Draw a tiny dot for every mouse click.",
+            position = 96, section = heatmap
+    )
+    default boolean showHeatmap() { return true; }
+
+    // --- Visuals (new names used by core overlay) ----------------------------
+    @ConfigItem(
+            keyName = "heatmapDotSizePx",
+            name = "Dot size (px)",
+            description = "Width/height of each click dot (1 = single pixel).",
+            position = 97, section = heatmap
+    )
+    default int heatmapDotSizePx() { return 1; }
+
+    @ConfigItem(
+            keyName = "heatmapDecayMs",
+            name = "Dot fade (ms)",
+            description = "How long each dot stays visible before fully fading.",
+            position = 98, section = heatmap
+    )
+    default int heatmapDecayMs() { return 900; }
+
+    @ConfigItem(
+            keyName = "heatmapColdColor",
+            name = "Cold color (hex)",
+            description = "Hex color for low-density areas (e.g. #1e90ff).",
+            position = 99, section = heatmap
+    )
+    default String heatmapColdColor() { return "#1e90ff"; } // DodgerBlue
+
+    @ConfigItem(
+            keyName = "heatmapHotColor",
+            name = "Hot color (hex)",
+            description = "Hex color for high-density areas (e.g. #ff4000).",
+            position = 100, section = heatmap
+    )
+    default String heatmapHotColor() { return "#ff4000"; }  // Orange-Red
+
+    @ConfigItem(
+            keyName = "heatmapAlpha",
+            name = "Dot alpha (0-255)",
+            description = "Transparency for dots; higher = more opaque.",
+            position = 101, section = heatmap
+    )
+    default int heatmapAlpha() { return 200; }
+
+    @ConfigItem(
+            keyName = "heatmapMaxPoints",
+            name = "Max dots",
+            description = "Upper bound on stored dots (memory/CPU guard).",
+            position = 102, section = heatmap
+    )
+    default int heatmapMaxPoints() { return 20000; }
+
+    enum HeatmapColorMode { MONO, HOT_COLD }
+
+    @ConfigItem(
+            keyName = "heatmapColorMode",
+            name = "Color mode",
+            description = "MONO = one color; HOT_COLD = blue→red by local density.",
+            position = 103, section = heatmap
+    )
+    default HeatmapColorMode heatmapColorMode() { return HeatmapColorMode.HOT_COLD; }
+
+    // --- Export options ------------------------------------------------------
+    @ConfigItem(
+            keyName = "heatmapExportEnabled",
+            name = "Enable periodic export",
+            description = "If enabled, the core heatmap overlay will write out PNG snapshots.",
+            position = 104, section = heatmap
+    )
+    default boolean heatmapExportEnabled() { return false; }
+
+    @ConfigItem(
+            keyName = "heatmapExportEveryMs",
+            name = "Export interval (ms)",
+            description = "How often to save a heatmap PNG while enabled.",
+            position = 105, section = heatmap
+    )
+    default int heatmapExportEveryMs() { return 15000; } // 15s
+
+    @ConfigItem(
+            keyName = "heatmapExportFolder",
+            name = "Export folder",
+            description = "Absolute or relative folder to write PNGs into.",
+            position = 106, section = heatmap
+    )
+    default String heatmapExportFolder() { return "heist-heatmaps"; }
+
+    // ------------------------------------------------------------------------
+    // Backward-compat convenience (aliases to old names you previously used)
+    // These keep older code/readers happy while core uses the new names above.
+    // ------------------------------------------------------------------------
+    @ConfigItem(
+            keyName = "heatmapDotRadiusPx",
+            name = "Dot radius (px)",
+            description = "Deprecated: use Dot size (px).",
+            position = 107, section = heatmap
+    )
+    default int heatmapDotRadiusPx() { return Math.max(1, heatmapDotSizePx() / 2); }
+
+    @ConfigItem(
+            keyName = "heatmapFadeMs",
+            name = "Dot fade (ms) [compat]",
+            description = "Deprecated: use Dot fade (ms) in new section.",
+            position = 108, section = heatmap
+    )
+    default int heatmapFadeMs() { return heatmapDecayMs(); }
 }
