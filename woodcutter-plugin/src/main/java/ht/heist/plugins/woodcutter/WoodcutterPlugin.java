@@ -1,27 +1,62 @@
-/**
- * WoodcutterPlugin
- * Handles automated tree-chopping logic with human-like behavior.
- * Depends on MouseService + HumanizerService.
- */
+// ============================================================================
+// WoodcutterPlugin.java
+// -----------------------------------------------------------------------------
+// Purpose
+//   Thin woodcutting plugin that delegates input/timing to core services.
+//   - Red-click legacy behavior via MouseServiceImpl
+//   - Dynamic dropping: re-scan inventory each tick (no stale rects)
+//   - Natural drop order: always the first remaining log (top→down, left→right)
+//   - Heatmap shows ACTUAL click points via MouseServiceImpl tap hook
+//   - Uses HeistCoreConfig for waits (no dead plugin knobs)
+//
+// Requirements
+//   - Java 11 compatible
+//   - Depends on: HeistCoreConfig, MouseService, HumanizerService, WoodcutterConfig
+//   - WoodcutterConfig group id: "heistwoodcutter"
+// ============================================================================
+
 package ht.heist.plugins.woodcutter;
 
+// ============================================================================
+// Imports: Core & RuneLite
+// ============================================================================
 import com.google.inject.Provides;
 import ht.heist.core.config.HeistCoreConfig;
+import ht.heist.core.impl.MouseServiceImpl;   // for heatmap tap hook
 import ht.heist.core.services.HumanizerService;
 import ht.heist.core.services.MouseService;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.*;
+
+import net.runelite.api.AnimationID;
+import net.runelite.api.Client;
+import net.runelite.api.CollisionData;
+import net.runelite.api.CollisionDataFlag;
+import net.runelite.api.Constants;
+import net.runelite.api.EquipmentInventorySlot;
+import net.runelite.api.GameObject;
+import net.runelite.api.GameState;
+import net.runelite.api.InventoryID;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.Perspective;
+import net.runelite.api.Player;
+import net.runelite.api.Scene;
+import net.runelite.api.Tile;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
+
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
 
+// ============================================================================
+// Imports: JDK
+// ============================================================================
 import javax.inject.Inject;
 import java.awt.Canvas;
 import java.awt.Rectangle;
@@ -29,47 +64,64 @@ import java.awt.Shape;
 import java.awt.event.KeyEvent;
 import java.util.*;
 
+// ============================================================================
+// @PluginDescriptor
+// ============================================================================
 @Slf4j
 @PluginDescriptor(
         name = "Heist Woodcutter",
-        description = "A sophisticated woodcutting plugin using AWT Event Dispatching.",
-        tags = {"woodcutting", "automation", "educational", "heist"}
+        description = "A thin woodcutting plugin that uses core services for human-like input.",
+        tags = {"woodcutting", "automation", "heist"}
 )
 public class WoodcutterPlugin extends Plugin
 {
+    // =========================================================================
+    // === Injected Services & Config =========================================
+    // =========================================================================
     @Inject private Client client;
-    @Inject private WoodcutterConfig config;
+    @Inject private WoodcutterConfig config;          // plugin knobs (tree type, log handling, overlay)
     @Inject private OverlayManager overlayManager;
     @Inject private HeatmapOverlay heatmapOverlay;
 
-    // Injected core services
-    @Inject private HumanizerService humanizer;
-    @Inject private MouseService mouse;
+    @Inject private HumanizerService humanizer;       // timing helpers
+    @Inject private MouseService mouse;               // core input (red-click)
+    @Inject private HeistCoreConfig coreCfg;          // shared core timings
 
+    // =========================================================================
+    // === State & Session Fields =============================================
+    // =========================================================================
     private State currentState;
-    private long stateTimeout = 0;
-    private long nextActionTime = 0;
+    private long stateTimeout = 0L;
+    private long nextActionTime = 0L;
     private WorldPoint startLocation;
 
     private GameObject currentTarget;
     private final Map<WorldPoint, Long> blacklist = new HashMap<>();
     private static final long BLACKLIST_DURATION_MS = 10_000;
 
+    // =========================================================================
+    // === Static Lookups / Constants =========================================
+    // =========================================================================
+    // Axe animation lookup
     private static final Map<Integer, Integer> AXE_ANIMATION_MAP = new HashMap<>();
     static
     {
-        AXE_ANIMATION_MAP.put(ItemID.BRONZE_AXE, AnimationID.WOODCUTTING_BRONZE);
-        AXE_ANIMATION_MAP.put(ItemID.IRON_AXE, AnimationID.WOODCUTTING_IRON);
-        AXE_ANIMATION_MAP.put(ItemID.STEEL_AXE, AnimationID.WOODCUTTING_STEEL);
-        AXE_ANIMATION_MAP.put(ItemID.MITHRIL_AXE, AnimationID.WOODCUTTING_MITHRIL);
-        AXE_ANIMATION_MAP.put(ItemID.ADAMANT_AXE, AnimationID.WOODCUTTING_ADAMANT);
-        AXE_ANIMATION_MAP.put(ItemID.RUNE_AXE, AnimationID.WOODCUTTING_RUNE);
+        AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.BRONZE_AXE,   AnimationID.WOODCUTTING_BRONZE);
+        AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.IRON_AXE,     AnimationID.WOODCUTTING_IRON);
+        AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.STEEL_AXE,    AnimationID.WOODCUTTING_STEEL);
+        AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.MITHRIL_AXE,  AnimationID.WOODCUTTING_MITHRIL);
+        AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.ADAMANT_AXE,  AnimationID.WOODCUTTING_ADAMANT);
+        AXE_ANIMATION_MAP.put(net.runelite.api.ItemID.RUNE_AXE,     AnimationID.WOODCUTTING_RUNE);
     }
 
-    private static final int TINDERBOX_ID = ItemID.TINDERBOX;
-    private static final int FIRE_OBJECT_ID = ObjectID.FIRE_26185;
+    // Firemaking bits (use raw ids to avoid RL constant mismatches)
+    private static final int TINDERBOX_ID = net.runelite.api.ItemID.TINDERBOX;
+    private static final int FIRE_OBJECT_ID = 26185; // was ObjectID.FIRE_26185
     private static final int FIREMAKING_ANIMATION_ID = AnimationID.FIREMAKING;
 
+    // =========================================================================
+    // === Enum: High-level State Machine =====================================
+    // =========================================================================
     private enum State
     {
         STARTING, IDLE, FINDING_TREE, WALKING_TO_TREE, VERIFYING_CHOP_START, CHOPPING,
@@ -77,14 +129,26 @@ public class WoodcutterPlugin extends Plugin
         WAITING_FOR_FIRE_TO_BURN, MOVING_TO_SAFE_TILE, RECOVERING
     }
 
-    // ---------------- Lifecycle ----------------
-
+    // =========================================================================
+    // === Lifecycle: startUp / shutDown ======================================
+    // =========================================================================
     @Override
     protected void startUp()
     {
+        // --- Overlay on & clear ----------------------------------------------
         overlayManager.add(heatmapOverlay);
         heatmapOverlay.clearPoints();
 
+        // --- Wire heatmap to ACTUAL click points from MouseServiceImpl --------
+        if (mouse instanceof MouseServiceImpl)
+        {
+            MouseServiceImpl impl = (MouseServiceImpl) mouse;
+            impl.setClickTapListener(p ->
+                    heatmapOverlay.addPoint(new net.runelite.api.Point(p.x, p.y))
+            );
+        }
+
+        // --- Boot state --------------------------------------------------------
         if (client.getGameState() == GameState.LOGGED_IN)
         {
             initializePluginState();
@@ -102,36 +166,18 @@ public class WoodcutterPlugin extends Plugin
         log.info("Heist Woodcutter stopped.");
     }
 
-    private void initializePluginState()
-    {
-        final Player local = client.getLocalPlayer();
-        if (local != null)
-        {
-            startLocation = local.getWorldLocation();
-            log.info("Heist Woodcutter started. Start location saved: {}", startLocation);
-            setState(State.FINDING_TREE);
-        }
-        else
-        {
-            setState(State.STARTING);
-        }
-    }
+    // =========================================================================
+    // === DI Providers (Guice) ================================================
+    // =========================================================================
+    @Provides
+    WoodcutterConfig provideConfig(ConfigManager cm) { return cm.getConfig(WoodcutterConfig.class); }
 
     @Provides
-    WoodcutterConfig provideConfig(ConfigManager configManager)
-    {
-        return configManager.getConfig(WoodcutterConfig.class);
-    }
+    HeistCoreConfig provideHeistCoreConfig(ConfigManager cm) { return cm.getConfig(HeistCoreConfig.class); }
 
-    // Bind HeistCoreConfig so MouseServiceImpl (and others) can inject it
-    @Provides
-    HeistCoreConfig provideHeistCoreConfig(ConfigManager configManager)
-    {
-        return configManager.getConfig(HeistCoreConfig.class);
-    }
-
-    // ---------------- Tick Loop ----------------
-
+    // =========================================================================
+    // === Tick Loop & State Runner ===========================================
+    // =========================================================================
     @Subscribe
     public void onGameTick(GameTick event)
     {
@@ -147,6 +193,7 @@ public class WoodcutterPlugin extends Plugin
             return;
         }
 
+        // --- Guard: has axe ----------------------------------------------------
         if (getEquippedAxeId() == -1)
         {
             log.error("No axe equipped. Stopping.");
@@ -154,6 +201,7 @@ public class WoodcutterPlugin extends Plugin
             return;
         }
 
+        // --- Only enter handling when NOT already handling --------------------
         if (isInventoryFull() && isNotHandlingInventory())
         {
             log.info("Inventory is full. Switching to HANDLE_INVENTORY state.");
@@ -167,31 +215,31 @@ public class WoodcutterPlugin extends Plugin
     {
         switch (currentState)
         {
-            case FINDING_TREE:                 handleFindingTreeState(); break;
-            case WALKING_TO_TREE:              handleWalkingState(); break;
-            case VERIFYING_CHOP_START:         handleVerifyChopStartState(); break;
-            case CHOPPING:                     handleChoppingState(); break;
-            case HANDLING_INVENTORY:           handleInventoryState(); break;
-            case DROPPING_LOGS:                handleDroppingState(); break;
-            case BURNING_LOGS:                 handleBurningState(); break;
-            case VERIFYING_FIREMAKING_START:   handleVerifyFiremakingState(); break;
-            case WAITING_FOR_FIRE_TO_BURN:     handleWaitingForFireState(); break;
-            case MOVING_TO_SAFE_TILE:          handleMovingToSafeTileState(); break;
-            case RECOVERING:                   handleRecoveryState(); break;
+            case FINDING_TREE:               handleFindingTreeState(); break;
+            case WALKING_TO_TREE:            handleWalkingState(); break;
+            case VERIFYING_CHOP_START:       handleVerifyChopStartState(); break;
+            case CHOPPING:                   handleChoppingState(); break;
+            case HANDLING_INVENTORY:         handleInventoryState(); break;
+            case DROPPING_LOGS:              handleDroppingState(); break;
+            case BURNING_LOGS:               handleBurningState(); break;
+            case VERIFYING_FIREMAKING_START: handleVerifyFiremakingState(); break;
+            case WAITING_FOR_FIRE_TO_BURN:   handleWaitingForFireState(); break;
+            case MOVING_TO_SAFE_TILE:        handleMovingToSafeTileState(); break;
+            case RECOVERING:                 handleRecoveryState(); break;
             case IDLE:
             case STARTING:
             default: break;
         }
     }
 
-    // ---------------- States ----------------
+    // =========================================================================
+    // === State Handlers ======================================================
+    // =========================================================================
 
+    // --- FINDING_TREE --------------------------------------------------------
     private void handleFindingTreeState()
     {
-        if (isPlayerBusy())
-        {
-            return;
-        }
+        if (isPlayerBusy()) return;
 
         currentTarget = findNearestTreeByIteration();
         if (currentTarget != null)
@@ -207,6 +255,7 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
+    // --- WALKING_TO_TREE -----------------------------------------------------
     private void handleWalkingState()
     {
         if (client.getLocalPlayer().getAnimation() == getEquippedAxeAnimation())
@@ -224,6 +273,7 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
+    // --- VERIFYING_CHOP_START ------------------------------------------------
     private void handleVerifyChopStartState()
     {
         if (client.getLocalPlayer().getAnimation() == getEquippedAxeAnimation())
@@ -247,26 +297,25 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
+    // --- CHOPPING ------------------------------------------------------------
     private void handleChoppingState()
     {
         if (client.getLocalPlayer().getAnimation() != getEquippedAxeAnimation())
         {
             log.info("Chopping animation stopped. Assuming tree is gone.");
-            if (currentTarget != null)
-            {
-                blacklist(currentTarget.getWorldLocation());
-            }
+            if (currentTarget != null) blacklist(currentTarget.getWorldLocation());
             setState(State.FINDING_TREE);
         }
     }
 
+    // --- HANDLING_INVENTORY --------------------------------------------------
     private void handleInventoryState()
     {
         if (!isInventoryOpen())
         {
             log.info("Opening inventory tab (ESC).");
             dispatchKey(KeyEvent.VK_ESCAPE);
-            setWait(config.actionMode().getDefaultWaitMean(), config.actionMode().getDefaultWaitMean() + 600);
+            setWait(coreCfg.reactionMeanMs(), coreCfg.reactionMeanMs() + 600);
             return;
         }
 
@@ -280,23 +329,28 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
+    // --- DROPPING_LOGS (Natural: always first remaining log) -----------------
     private void handleDroppingState()
     {
-        Widget logToDrop = getFirstLogFromInventory();
-        if (logToDrop != null)
+        // Re-scan inventory each tick and sort naturally (y, then x)
+        List<Widget> logsNow = currentLogWidgetsSortedNatural();
+        if (logsNow.isEmpty())
         {
-            log.info("Dropping log: {}", getLogName());
-            clickRectHuman(logToDrop.getBounds(), true);
-            setWait(config.actionMode().getDefaultWaitMean(),
-                    config.actionMode().getDefaultWaitMean() + 100);
-        }
-        else
-        {
-            log.info("Finished dropping all logs.");
+            log.info("No logs remain. Done dropping.");
             setState(State.FINDING_TREE);
+            return;
         }
+
+        // Always pick the first remaining log; yields natural L→R, top→down
+        Widget target = logsNow.get(0);
+        Rectangle r = target.getBounds();
+        log.info("Dropping log at {}", r);
+
+        clickRectHuman(r, true); // shift-drop
+        setWait(coreCfg.reactionMeanMs(), coreCfg.reactionMeanMs() + 100);
     }
 
+    // --- BURNING_LOGS --------------------------------------------------------
     private void handleBurningState()
     {
         if (isStandingOnFireByIteration(client.getLocalPlayer().getWorldLocation()))
@@ -312,9 +366,10 @@ public class WoodcutterPlugin extends Plugin
         if (tinderbox != null && logToBurn != null)
         {
             log.info("Attempting to burn a {}", getLogName());
+
             clickRectHuman(tinderbox.getBounds(), false);
-            setWait(config.actionMode().getReactionTimeMean(),
-                    config.actionMode().getReactionTimeMean() + 100);
+            setWait(coreCfg.reactionMeanMs(), coreCfg.reactionMeanMs() + 100);
+
             clickRectHuman(logToBurn.getBounds(), false);
             setState(State.VERIFYING_FIREMAKING_START, 3000);
         }
@@ -325,6 +380,7 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
+    // --- MOVING_TO_SAFE_TILE -------------------------------------------------
     private void handleMovingToSafeTileState()
     {
         if (!isPlayerMoving())
@@ -348,6 +404,7 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
+    // --- VERIFYING_FIREMAKING_START -----------------------------------------
     private void handleVerifyFiremakingState()
     {
         if (client.getLocalPlayer().getAnimation() == FIREMAKING_ANIMATION_ID)
@@ -362,17 +419,18 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
+    // --- WAITING_FOR_FIRE_TO_BURN -------------------------------------------
     private void handleWaitingForFireState()
     {
         if (client.getLocalPlayer().getAnimation() != FIREMAKING_ANIMATION_ID)
         {
             log.info("Firemaking animation finished.");
-            setWait(config.actionMode().getDefaultWaitMean(),
-                    config.actionMode().getDefaultWaitMean() * 2);
+            setWait(coreCfg.reactionMeanMs(), coreCfg.reactionMeanMs() * 2);
             setState(State.BURNING_LOGS);
         }
     }
 
+    // --- RECOVERING ----------------------------------------------------------
     private void handleRecoveryState()
     {
         if (startLocation != null
@@ -385,12 +443,30 @@ public class WoodcutterPlugin extends Plugin
         setState(State.FINDING_TREE);
     }
 
-    // ---------------- Helpers ----------------
+    // =========================================================================
+    // === Helpers: Targeting / Scene / Inventory =============================
+    // =========================================================================
 
+    // --- Startup init --------------------------------------------------------
+    private void initializePluginState()
+    {
+        final Player local = client.getLocalPlayer();
+        if (local != null)
+        {
+            startLocation = local.getWorldLocation();
+            log.info("Heist Woodcutter started. Start location saved: {}", startLocation);
+            setState(State.FINDING_TREE);
+        }
+        else
+        {
+            setState(State.STARTING);
+        }
+    }
+
+    // --- Find nearest tree by scene scan ------------------------------------
     private GameObject findNearestTreeByIteration()
     {
         cleanBlacklist();
-
         final Player local = client.getLocalPlayer();
         if (local == null) return null;
 
@@ -426,6 +502,7 @@ public class WoodcutterPlugin extends Plugin
                 .orElse(null);
     }
 
+    // --- Fire detection on current tile -------------------------------------
     private boolean isStandingOnFireByIteration(WorldPoint loc)
     {
         LocalPoint lp = LocalPoint.fromWorld(client, loc);
@@ -438,6 +515,7 @@ public class WoodcutterPlugin extends Plugin
                 .anyMatch(o -> o != null && o.getId() == FIRE_OBJECT_ID);
     }
 
+    // --- Find nearby safe tile ----------------------------------------------
     private WorldPoint findSafeNearbyTile(WorldPoint center)
     {
         Player local = client.getLocalPlayer();
@@ -460,10 +538,7 @@ public class WoodcutterPlugin extends Plugin
                     {
                         int flags = cols[client.getPlane()].getFlags()[lp.getSceneX()][lp.getSceneY()];
                         boolean blocked = (flags & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0;
-                        if (!blocked && !isStandingOnFireByIteration(wp))
-                        {
-                            return wp;
-                        }
+                        if (!blocked && !isStandingOnFireByIteration(wp)) return wp;
                     }
                 }
             }
@@ -471,32 +546,7 @@ public class WoodcutterPlugin extends Plugin
         return null;
     }
 
-    private boolean isNotHandlingInventory()
-    {
-        return currentState != State.HANDLING_INVENTORY
-                && currentState != State.DROPPING_LOGS
-                && currentState != State.BURNING_LOGS
-                && currentState != State.VERIFYING_FIREMAKING_START
-                && currentState != State.WAITING_FOR_FIRE_TO_BURN
-                && currentState != State.MOVING_TO_SAFE_TILE;
-    }
-
-    private void clickOnMinimap(WorldPoint target)
-    {
-        LocalPoint lp = LocalPoint.fromWorld(client, target);
-        if (lp == null) return;
-
-        net.runelite.api.Point p = Perspective.localToMinimap(client, lp);
-        if (p != null)
-        {
-            if (config.drawHeatmap())
-            {
-                heatmapOverlay.addPoint(new net.runelite.api.Point(p.getX(), p.getY()));
-            }
-            mouse.humanClick(new Rectangle(p.getX(), p.getY(), 1, 1), false);
-        }
-    }
-
+    // --- Inventory read helpers ---------------------------------------------
     private boolean isInventoryFull()
     {
         ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
@@ -506,41 +556,6 @@ public class WoodcutterPlugin extends Plugin
     private boolean isInventoryOpen()
     {
         return client.getWidget(WidgetInfo.INVENTORY) != null;
-    }
-
-    private boolean isPlayerBusy()
-    {
-        Player local = client.getLocalPlayer();
-        return local.getAnimation() != -1 || isPlayerMoving() || local.getInteracting() != null;
-    }
-
-    private boolean isPlayerMoving()
-    {
-        Player local = client.getLocalPlayer();
-        return local.getPoseAnimation() != local.getIdlePoseAnimation();
-    }
-
-    private int getEquippedAxeAnimation()
-    {
-        return AXE_ANIMATION_MAP.getOrDefault(getEquippedAxeId(), -1);
-    }
-
-    private int getEquippedAxeId()
-    {
-        ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);
-        if (eq == null) return -1;
-        Item weapon = eq.getItem(EquipmentInventorySlot.WEAPON.getSlotIdx());
-        return weapon != null ? weapon.getId() : -1;
-    }
-
-    private List<Integer> getLogIds()
-    {
-        return Arrays.asList(ItemID.LOGS, ItemID.OAK_LOGS, ItemID.WILLOW_LOGS, ItemID.MAPLE_LOGS);
-    }
-
-    private String getLogName()
-    {
-        return config.treeType() == WoodcutterConfig.TreeType.OAK ? "Oak log" : "log";
     }
 
     private Widget getFirstLogFromInventory()
@@ -564,6 +579,58 @@ public class WoodcutterPlugin extends Plugin
         return getInventoryItem(Collections.singletonList(id));
     }
 
+    // --- Current logs (natural order) ---------------------------------------
+    private List<Widget> currentLogWidgetsSortedNatural()
+    {
+        Widget inv = client.getWidget(WidgetInfo.INVENTORY);
+        if (inv == null) return Collections.emptyList();
+
+        final Set<Integer> logIds = new HashSet<>(getLogIds());
+        List<Widget> items = new ArrayList<>();
+        for (Widget w : inv.getDynamicChildren())
+        {
+            if (w != null && logIds.contains(w.getItemId()))
+            {
+                items.add(w);
+            }
+        }
+        // Sort by row (y) then column (x). No “snaking”.
+        items.sort(Comparator
+                .comparingInt((Widget w) -> w.getBounds().y)
+                .thenComparingInt(w -> w.getBounds().x));
+        return items;
+    }
+
+    private List<Integer> getLogIds()
+    {
+        return Arrays.asList(
+                net.runelite.api.ItemID.LOGS,
+                net.runelite.api.ItemID.OAK_LOGS,
+                net.runelite.api.ItemID.WILLOW_LOGS,
+                net.runelite.api.ItemID.MAPLE_LOGS
+        );
+    }
+
+    private String getLogName()
+    {
+        return config.treeType() == WoodcutterConfig.TreeType.OAK ? "Oak log" : "log";
+    }
+
+    // =========================================================================
+    // === Helpers: State / Wait / Blacklist / Input ==========================
+    // =========================================================================
+
+    // --- Inventory state guard (prevents re-entering while handling) ----------
+    private boolean isNotHandlingInventory()
+    {
+        return currentState != State.HANDLING_INVENTORY
+                && currentState != State.DROPPING_LOGS
+                && currentState != State.BURNING_LOGS
+                && currentState != State.VERIFYING_FIREMAKING_START
+                && currentState != State.WAITING_FOR_FIRE_TO_BURN
+                && currentState != State.MOVING_TO_SAFE_TILE;
+    }
+
     private void setState(State newState, long timeoutMs)
     {
         if (currentState != newState)
@@ -574,25 +641,16 @@ public class WoodcutterPlugin extends Plugin
         }
     }
 
-    private void setState(State newState)
-    {
-        setState(newState, 0);
-    }
+    private void setState(State newState) { setState(newState, 0); }
 
-    private boolean isInteractionTimeout()
-    {
-        return stateTimeout != 0 && System.currentTimeMillis() > stateTimeout;
-    }
+    private boolean isInteractionTimeout() { return stateTimeout != 0 && System.currentTimeMillis() > stateTimeout; }
 
     private void setWait(int minMs, int maxMs)
     {
         nextActionTime = System.currentTimeMillis() + humanizer.randomDelay(minMs, maxMs);
     }
 
-    private boolean isWaiting()
-    {
-        return System.currentTimeMillis() < nextActionTime;
-    }
+    private boolean isWaiting() { return System.currentTimeMillis() < nextActionTime; }
 
     private void blacklist(WorldPoint point)
     {
@@ -607,35 +665,29 @@ public class WoodcutterPlugin extends Plugin
         blacklist.entrySet().removeIf(e -> now > e.getValue());
     }
 
-    // centralize “human click + heatmap”
+    // --- Minimap click (uses core mouse) ------------------------------------
+    private void clickOnMinimap(WorldPoint target)
+    {
+        LocalPoint lp = LocalPoint.fromWorld(client, target);
+        if (lp == null) return;
+
+        net.runelite.api.Point p = Perspective.localToMinimap(client, lp);
+        if (p != null) mouse.humanClick(new Rectangle(p.getX(), p.getY(), 1, 1), false);
+    }
+
+    // --- Input helpers (clicks & keys) --------------------------------------
     private void clickShapeHuman(Shape shape, boolean shift)
     {
         if (shape == null) return;
-
-        if (config.drawHeatmap())
-        {
-            Rectangle b = shape.getBounds();
-            int cx = (int) Math.round(b.getCenterX());
-            int cy = (int) Math.round(b.getCenterY());
-            heatmapOverlay.addPoint(new net.runelite.api.Point(cx, cy));
-        }
-        mouse.humanClick(shape, shift);
+        mouse.humanClick(shape, shift);   // heatmap is fed by MouseServiceImpl hook
     }
 
     private void clickRectHuman(Rectangle rect, boolean shift)
     {
         if (rect == null) return;
-
-        if (config.drawHeatmap())
-        {
-            int cx = (int) Math.round(rect.getCenterX());
-            int cy = (int) Math.round(rect.getCenterY());
-            heatmapOverlay.addPoint(new net.runelite.api.Point(cx, cy));
-        }
-        mouse.humanClick(rect, shift);
+        mouse.humanClick(rect, shift);    // heatmap is fed by MouseServiceImpl hook
     }
 
-    // simple key dispatch (ESC for inventory)
     private void dispatchKey(int keyCode)
     {
         Canvas canvas = client.getCanvas();
@@ -649,10 +701,33 @@ public class WoodcutterPlugin extends Plugin
             KeyEvent release = new KeyEvent(canvas, KeyEvent.KEY_RELEASED, System.currentTimeMillis(), 0, keyCode, KeyEvent.CHAR_UNDEFINED);
             canvas.dispatchEvent(release);
         }
-        catch (Exception ignored)
-        {
-            // IMPORTANT: do not re-interrupt here.
-            // Re-interrupting will cause future sleeps to be skipped.
-        }
+        catch (Exception ignored) { /* don't re-interrupt */ }
+    }
+
+    // --- Player / Axe helpers ------------------------------------------------
+    private int getEquippedAxeId()
+    {
+        ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);
+        if (eq == null) return -1;
+        Item weapon = eq.getItem(EquipmentInventorySlot.WEAPON.getSlotIdx());
+        return weapon != null ? weapon.getId() : -1;
+    }
+
+    private int getEquippedAxeAnimation()
+    {
+        return AXE_ANIMATION_MAP.getOrDefault(getEquippedAxeId(), -1);
+    }
+
+    private boolean isPlayerMoving()
+    {
+        Player local = client.getLocalPlayer();
+        return local != null && local.getPoseAnimation() != local.getIdlePoseAnimation();
+    }
+
+    private boolean isPlayerBusy()
+    {
+        Player local = client.getLocalPlayer();
+        if (local == null) return true; // safe default until logged in
+        return local.getAnimation() != -1 || isPlayerMoving() || local.getInteracting() != null;
     }
 }

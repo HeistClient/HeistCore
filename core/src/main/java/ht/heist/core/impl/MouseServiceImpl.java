@@ -2,12 +2,11 @@
 // MouseServiceImpl.java
 // -----------------------------------------------------------------------------
 // Purpose
-//   EXACTLY mimic the previous “working” click path used in your old plugin:
-//     • Use a single-thread ExecutorService (no client-thread work).
-//     • Dispatch AWT events directly on the Canvas: MOUSE_MOVED -> sleep
-//       -> MOUSE_PRESSED -> sleep -> MOUSE_RELEASED.
-//     • Optional SHIFT key press/release around the mouse press.
-//   No menu polling, no EDT flushes, no tick waiting — just the old behavior.
+//   EXACT legacy red-click path plus:
+//     • 4×4 stratified anti-repeat sampling per bounds (visible variety even
+//       if you always click the same inventory slot repeatedly)
+//     • Optional overshoot + fatigue scaling
+//     • Optional heatmap tap hook to draw the ACTUAL click point
 // ============================================================================
 
 package ht.heist.core.impl;
@@ -24,37 +23,43 @@ import java.awt.Shape;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 public class MouseServiceImpl implements MouseService
 {
-    // ------------------------------------------------------------------------
-    // Dependencies
-    // ------------------------------------------------------------------------
     private final Client client;
     private final HumanizerService human;
     private final HeistCoreConfig cfg;
 
-    // ------------------------------------------------------------------------
-    // Worker thread (mirrors the old HumanBehavior executor)
-    // ------------------------------------------------------------------------
-    private final ExecutorService executor = Executors.newSingleThreadExecutor(r ->
-    {
+    private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "Heist-MouseService");
         t.setDaemon(true);
         return t;
     });
 
-    // ------------------------------------------------------------------------
-    // Random for gaussian selection inside target shapes
-    // ------------------------------------------------------------------------
     private final Random rng = new Random();
+    private final long sessionStartMs = System.currentTimeMillis();
 
-    // ------------------------------------------------------------------------
-    // Constructor
-    // ------------------------------------------------------------------------
+    // Per-bounds stratified cycle state
+    private static final class ClickPattern {
+        List<int[]> cells;  // each {cx, cy}, with cx,cy in [0..3]
+        int idx = 0;
+        java.awt.Point last = null;
+    }
+    private final ConcurrentHashMap<Integer, ClickPattern> patternByBounds = new ConcurrentHashMap<>();
+
+    // Optional: external listener to tap into actual click point (for heatmap)
+    private volatile Consumer<java.awt.Point> clickTapListener = null;
+    public void setClickTapListener(Consumer<java.awt.Point> listener) { this.clickTapListener = listener; }
+
     @Inject
     public MouseServiceImpl(Client client, HumanizerService human, HeistCoreConfig cfg)
     {
@@ -63,31 +68,21 @@ public class MouseServiceImpl implements MouseService
         this.cfg = cfg;
     }
 
-    // ------------------------------------------------------------------------
-    // Public API: click by Shape
-    // ------------------------------------------------------------------------
     @Override
     public void humanClick(Shape targetShape, boolean shift)
     {
         if (targetShape == null) return;
-        Rectangle bounds = targetShape.getBounds();
-        humanClick(bounds, shift);
+        humanClick(targetShape.getBounds(), shift);
     }
 
-    // ------------------------------------------------------------------------
-    // Public API: click by Rectangle
-    // ------------------------------------------------------------------------
     @Override
     public void humanClick(Rectangle bounds, boolean shift)
     {
         if (bounds == null) return;
-        final java.awt.Point clickPoint = gaussianPointIn(bounds);
+        final java.awt.Point clickPoint = pickPoint(bounds);
         dispatchClick(clickPoint, shift);
     }
 
-    // ------------------------------------------------------------------------
-    // Public API: move-only
-    // ------------------------------------------------------------------------
     @Override
     public void moveMouseTo(java.awt.Point p)
     {
@@ -98,22 +93,14 @@ public class MouseServiceImpl implements MouseService
         human.sleep(cfg.canvasMoveSleepMinMs(), cfg.canvasMoveSleepMaxMs());
     }
 
-    // ------------------------------------------------------------------------
-    // Public API: click at a specific Point
-    // (required by MouseService interface)
-    // ------------------------------------------------------------------------
     @Override
     public void clickAt(java.awt.Point p, boolean shift)
     {
         if (p == null) return;
-        // Wrap a single-point rectangle so we reuse gaussian logic
         humanClick(new Rectangle(p.x, p.y, 1, 1), shift);
     }
 
-    // ------------------------------------------------------------------------
-    // Internal: schedule the actual click task on executor
-    // ------------------------------------------------------------------------
-    private void dispatchClick(java.awt.Point clickPoint, boolean shift)
+    private void dispatchClick(java.awt.Point target, boolean shift)
     {
         executor.submit(() -> {
             try
@@ -121,37 +108,49 @@ public class MouseServiceImpl implements MouseService
                 final Canvas canvas = client.getCanvas();
                 if (canvas == null) return;
 
-                // --- Move ----------------------------------------------------
-                dispatchMouse(canvas, MouseEvent.MOUSE_MOVED, clickPoint.x, clickPoint.y, 0, 0, 0);
-                sleepGaussian(cfg.reactionMeanMs(), cfg.reactionStdMs());
+                // Optional overshoot (move past target, settle)
+                if (cfg.enableOvershoot() && rng.nextInt(100) < Math.max(0, Math.min(100, cfg.overshootChancePct())))
+                {
+                    java.awt.Point over = overshootPoint(target);
+                    dispatchMouse(canvas, MouseEvent.MOUSE_MOVED, over.x, over.y, 0, 0, 0);
+                    Thread.sleep(20 + rng.nextInt(25));
+                }
 
-                // --- Optional Shift -----------------------------------------
+                // Final MOVE to target
+                dispatchMouse(canvas, MouseEvent.MOUSE_MOVED, target.x, target.y, 0, 0, 0);
+                Thread.sleep(scaledGaussian(cfg.reactionMeanMs(), cfg.reactionStdMs()));
+
+                // Heatmap hook: reveal the actual click point
+                if (clickTapListener != null) clickTapListener.accept(target);
+
+                // Optional SHIFT down
                 int mods = 0;
                 if (shift)
                 {
                     mods = InputEvent.SHIFT_DOWN_MASK;
-                    KeyEvent shiftDown = new KeyEvent(canvas, KeyEvent.KEY_PRESSED, now(), mods, KeyEvent.VK_SHIFT, KeyEvent.CHAR_UNDEFINED);
-                    canvas.dispatchEvent(shiftDown);
-                    Thread.sleep(20);
+                    canvas.dispatchEvent(new KeyEvent(canvas, KeyEvent.KEY_PRESSED, System.currentTimeMillis(), mods, KeyEvent.VK_SHIFT, KeyEvent.CHAR_UNDEFINED));
+                    Thread.sleep(18 + rng.nextInt(10));
                 }
 
-                // --- Press ---------------------------------------------------
+                // PRESS
                 int pressMods = mods | InputEvent.BUTTON1_DOWN_MASK;
-                MouseEvent press = new MouseEvent(canvas, MouseEvent.MOUSE_PRESSED, now(), pressMods, clickPoint.x, clickPoint.y, 1, false, MouseEvent.BUTTON1);
-                canvas.dispatchEvent(press);
+                canvas.dispatchEvent(new MouseEvent(
+                        canvas, MouseEvent.MOUSE_PRESSED, System.currentTimeMillis(), pressMods, target.x, target.y, 1, false, MouseEvent.BUTTON1
+                ));
 
-                Thread.sleep(human.randomDelay(cfg.pressHoldMinMs(), cfg.pressHoldMaxMs()));
+                // HOLD
+                Thread.sleep(scaledUniform(cfg.pressHoldMinMs(), cfg.pressHoldMaxMs()));
 
-                // --- Release -------------------------------------------------
-                MouseEvent release = new MouseEvent(canvas, MouseEvent.MOUSE_RELEASED, now(), mods, clickPoint.x, clickPoint.y, 1, false, MouseEvent.BUTTON1);
-                canvas.dispatchEvent(release);
+                // RELEASE
+                canvas.dispatchEvent(new MouseEvent(
+                        canvas, MouseEvent.MOUSE_RELEASED, System.currentTimeMillis(), mods, target.x, target.y, 1, false, MouseEvent.BUTTON1
+                ));
 
-                // --- Optional Shift up --------------------------------------
+                // Optional SHIFT up
                 if (shift)
                 {
-                    Thread.sleep(20);
-                    KeyEvent shiftUp = new KeyEvent(canvas, KeyEvent.KEY_RELEASED, now(), 0, KeyEvent.VK_SHIFT, KeyEvent.CHAR_UNDEFINED);
-                    canvas.dispatchEvent(shiftUp);
+                    Thread.sleep(15 + rng.nextInt(10));
+                    canvas.dispatchEvent(new KeyEvent(canvas, KeyEvent.KEY_RELEASED, System.currentTimeMillis(), 0, KeyEvent.VK_SHIFT, KeyEvent.CHAR_UNDEFINED));
                 }
             }
             catch (InterruptedException ie)
@@ -161,42 +160,83 @@ public class MouseServiceImpl implements MouseService
         });
     }
 
-    // ------------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------------
-    private static long now() { return System.currentTimeMillis(); }
-
-    private void dispatchMouse(Canvas canvas, int id, int x, int y, int button, int modifiersEx, int clickCount)
+    private java.awt.Point pickPoint(Rectangle r)
     {
-        MouseEvent e = new MouseEvent(canvas, id, now(), modifiersEx, x, y, clickCount, false, button);
-        canvas.dispatchEvent(e);
-    }
+        final int key = Objects.hash(r.x, r.y, r.width, r.height);
 
-    private java.awt.Point gaussianPointIn(Rectangle r)
-    {
-        double meanX = r.getCenterX();
-        double meanY = r.getCenterY();
-        double stdX  = Math.max(1.0, r.getWidth() / 4.0);
-        double stdY  = Math.max(1.0, r.getHeight() / 4.0);
+        ClickPattern pat = patternByBounds.computeIfAbsent(key, k -> {
+            ClickPattern cp = new ClickPattern();
+            cp.cells = new ArrayList<>(16);
+            for (int cx = 0; cx < 4; cx++)
+                for (int cy = 0; cy < 4; cy++)
+                    cp.cells.add(new int[]{cx, cy});
+            Collections.shuffle(cp.cells, rng); // unique cell order per bounds
+            return cp;
+        });
 
-        java.awt.Point p = new java.awt.Point((int)meanX, (int)meanY);
-        for (int i = 0; i < 10; i++)
+        // Next cell (cycles 0..15)
+        int[] cell = pat.cells.get(pat.idx);
+        pat.idx = (pat.idx + 1) % pat.cells.size();
+
+        // Use inner 60% of rect, split into 4x4 cells; click near cell center
+        final double inner = 0.60;                   // central 60%
+        final double margin = (1.0 - inner) / 2.0;   // 0.20 each side
+        final double cellSpan = inner / 4.0;         // each cell is 15%
+
+        double baseX = margin + (cell[0] + 0.5) * cellSpan;
+        double baseY = margin + (cell[1] + 0.5) * cellSpan;
+        double jx = (rng.nextDouble() - 0.5) * cellSpan * 0.4; // ±20% of a cell
+        double jy = (rng.nextDouble() - 0.5) * cellSpan * 0.4;
+
+        int x = clamp((int)Math.round(r.x + (baseX + jx) * r.width),  r.x + 1, r.x + r.width  - 2);
+        int y = clamp((int)Math.round(r.y + (baseY + jy) * r.height), r.y + 1, r.y + r.height - 2);
+        java.awt.Point p = new java.awt.Point(x, y);
+
+        // Avoid micro-repeats
+        if (pat.last != null && pat.last.distance(p) < 2.0)
         {
-            int x = (int)Math.round(rng.nextGaussian() * stdX + meanX);
-            int y = (int)Math.round(rng.nextGaussian() * stdY + meanY);
-            if (r.contains(x, y))
-            {
-                p.x = x;
-                p.y = y;
-                break;
-            }
+            x = clamp(x + (rng.nextBoolean() ? 2 : -2), r.x + 1, r.x + r.width - 2);
+            y = clamp(y + (rng.nextBoolean() ? 2 : -2), r.y + 1, r.y + r.height - 2);
+            p.setLocation(x, y);
         }
+
+        pat.last = p;
         return p;
     }
 
-    private void sleepGaussian(int meanMs, int stdMs) throws InterruptedException
+    private java.awt.Point overshootPoint(java.awt.Point tgt)
     {
-        int dur = (int)Math.max(0, Math.round(Math.abs(rng.nextGaussian() * stdMs + meanMs)));
-        Thread.sleep(dur);
+        int dx = (rng.nextBoolean() ? 1 : -1) * (4 + rng.nextInt(8)); // 4..11 px
+        int dy = (rng.nextBoolean() ? 1 : -1) * (3 + rng.nextInt(6)); // 3..8 px
+        return new java.awt.Point(tgt.x + dx, tgt.y + dy);
     }
+
+    private int scaledGaussian(int mean, int std)
+    {
+        double base = Math.abs(rng.nextGaussian() * std + mean);
+        return (int)Math.max(0, Math.round(applyFatigue(base)));
+    }
+
+    private int scaledUniform(int min, int max)
+    {
+        int span = Math.max(0, max - min);
+        double base = min + rng.nextInt(span + 1);
+        return (int)Math.round(applyFatigue(base));
+    }
+
+    private double applyFatigue(double base)
+    {
+        if (!cfg.enableFatigue()) return base;
+        long elapsedMin = Math.max(0, (System.currentTimeMillis() - sessionStartMs) / 60000L);
+        double ramp = Math.min(1.0, elapsedMin / 60.0);         // hit max at ~60min
+        double scale = 1.0 + (cfg.fatigueMaxPct() / 100.0) * ramp;
+        return base * scale;
+    }
+
+    private void dispatchMouse(Canvas canvas, int id, int x, int y, int button, int modifiersEx, int clickCount)
+    {
+        canvas.dispatchEvent(new MouseEvent(canvas, id, System.currentTimeMillis(), modifiersEx, x, y, clickCount, false, button));
+    }
+
+    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 }
