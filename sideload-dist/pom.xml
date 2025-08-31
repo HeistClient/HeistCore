@@ -11,9 +11,10 @@
 
     <!-- Parent aggregator coordinates -->
     <parent>
-        <groupId>ht.heistcore</groupId>
-        <artifactId>heistcore</artifactId>
+        <groupId>ht.heist</groupId>
+        <artifactId>heist-parent</artifactId>
         <version>1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
     </parent>
 
     <modelVersion>4.0.0</modelVersion>
@@ -38,8 +39,8 @@
         <hud.jar>${project.basedir}/../heist-hud/target/heist-hud-${project.version}.jar</hud.jar>
         <woodcutter.jar>${project.basedir}/../woodcutter-plugin/target/woodcutter-plugin-${project.version}.jar</woodcutter.jar>
 
-        <!-- Add more plugins here as you create them -->
-        <!-- <future1.jar>${project.basedir}/../future-plugin-1/target/future-plugin-1-${project.version}.jar</future1.jar> -->
+    <!-- Add more plugins here as you create them -->
+    <future1.jar>${project.basedir}/../future-plugin-1/target/future-plugin-1-${project.version}.jar</future1.jar>
     </properties>
 
     <build>
@@ -62,10 +63,6 @@
                                 <!-- Copy each plugin jar into staging (fail if missing) -->
                                 <copy file="${hud.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
                                 <copy file="${woodcutter.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
-
-                                <!-- Example for future plugins (set failonerror to false while developing)
-                                <copy file="${future1.jar}" todir="${stage.dir}" failonerror="false" overwrite="true"/>
-                                -->
 
                                 <!-- Ensure RuneLite sideload folder exists -->
                                 <mkdir dir="${runelite.sideload.dir}"/>

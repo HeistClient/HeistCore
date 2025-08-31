@@ -1,12 +1,12 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
-                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 
     <parent>
-        <groupId>ht.heistcore</groupId>
-        <artifactId>heistcore</artifactId>
+        <groupId>ht.heist</groupId>
+        <artifactId>heist-parent</artifactId>
         <version>1.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
     </parent>
 
     <modelVersion>4.0.0</modelVersion>
@@ -14,24 +14,25 @@
     <packaging>jar</packaging>
 
     <dependencies>
-        <!-- Core module dependency -->
+        <!-- Core library -->
         <dependency>
-            <groupId>ht.heistcore</groupId>
-            <artifactId>core</artifactId>
-            <version>1.0-SNAPSHOT</version>
-            <scope>compile</scope>
+            <groupId>ht.heist</groupId>
+            <artifactId>core-lib</artifactId>
+            <version>${project.version}</version>
         </dependency>
 
         <!-- RuneLite client -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
+            <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
         <!-- RuneLite API -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>runelite-api</artifactId>
+            <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
 
