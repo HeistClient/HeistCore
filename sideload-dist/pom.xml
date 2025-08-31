@@ -1,55 +1,50 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!--
-==============================================================================
-MODULE: sideload-dist  (HeistCore/sideload-dist/pom.xml)
-ROLE
-  • Runs AFTER core + woodcutter-plugin are built (declared in reactor order).
-  • Copies their JARs to:
-      1) Local staging: HeistCore/sideload-dist/target/sideload/
-      2) Live folder:  C:/Users/barhoo/.runelite/sideloaded-plugins  (best-effort)
-WHY THIS VERSION
-  • Uses relative paths from this module: ${basedir}/../core/... and
-    ${basedir}/../woodcutter-plugin/..., which avoids property expansion issues.
-  • Binds to 'package' so your normal 'mvn clean package' triggers the copy.
-USAGE
-  • Close RuneLite so files aren’t locked.
-  • From repo root: mvn clean package
-  • Look for the "=== Heist sideload-dist ===" echoes in build output.
-==============================================================================
--->
+<!-- ================================================================
+     FILE: sideload-dist/pom.xml
+     MODULE PURPOSE:
+       Copies only plugin JARs to the RuneLite sideload folder.
+       Avoids using project.parent.basedir to prevent interpolation issues.
+     ================================================================ -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
 
-    <!-- ===== Standard coords ===== -->
-    <modelVersion>4.0.0</modelVersion>
+    <!-- Parent aggregator coordinates -->
     <parent>
         <groupId>ht.heistcore</groupId>
         <artifactId>heistcore</artifactId>
         <version>1.0-SNAPSHOT</version>
     </parent>
 
+    <modelVersion>4.0.0</modelVersion>
     <artifactId>sideload-dist</artifactId>
     <packaging>pom</packaging>
-    <name>HeistCore - Sideload Distributor</name>
 
-    <!-- ===== Paths / knobs ===== -->
+    <name>HeistCore - Sideload Distributor</name>
+    <description>Stage and copy RuneLite plugin JARs into the user's sideload folder.</description>
+
+    <!-- Shared properties for portability and clarity -->
     <properties>
-        <!-- Use forward slashes on Windows to avoid escaping issues -->
-        <sideload.dir>C:/Users/barhoo/.runelite/sideloaded-plugins</sideload.dir>
-        <!-- Local staging directory -->
-        <dist.dir>${project.build.directory}/sideload</dist.dir>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Where to stage JARs inside this module -->
+        <stage.dir>${project.build.directory}/sideload</stage.dir>
+
+        <!-- RuneLite sideload folder in the current user's home -->
+        <runelite.sideload.dir>${user.home}/.runelite/sideloaded-plugins</runelite.sideload.dir>
+
+        <!-- Paths to sibling module target folders relative to this module -->
+        <!-- Using project.basedir/.. avoids the parent.basedir interpolation issue -->
+        <hud.jar>${project.basedir}/../heist-hud/target/heist-hud-${project.version}.jar</hud.jar>
+        <woodcutter.jar>${project.basedir}/../woodcutter-plugin/target/woodcutter-plugin-${project.version}.jar</woodcutter.jar>
+
+        <!-- Add more plugins here as you create them -->
+        <!-- <future1.jar>${project.basedir}/../future-plugin-1/target/future-plugin-1-${project.version}.jar</future1.jar> -->
     </properties>
 
     <build>
         <plugins>
-            <!--
-              COPY TASKS
-              Phase: package (so it runs with your normal build)
-              What:  Stage to module-local dist, then copy to RuneLite sideload folder
-                     (best-effort; non-fatal if locked).
-              Note:  Uses RELATIVE PATHS from this module (../core, ../woodcutter-plugin).
-            -->
+            <!-- Ant-run: stage the JARs and copy them into RuneLite's sideload folder -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-antrun-plugin</artifactId>
@@ -60,31 +55,33 @@ USAGE
                         <phase>package</phase>
                         <configuration>
                             <target>
-                                <!-- Make the staging dir -->
-                                <mkdir dir="${dist.dir}"/>
+                                <!-- Create staging directory -->
+                                <mkdir dir="${stage.dir}"/>
+                                <echo>Staging plugin jars into: ${stage.dir}</echo>
 
-                                <echo>=== Heist sideload-dist: staging jars to ${dist.dir}</echo>
+                                <!-- Copy each plugin jar into staging (fail if missing) -->
+                                <copy file="${hud.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
+                                <copy file="${woodcutter.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
 
-                                <!-- Stage sibling module jars (built earlier in reactor) -->
-                                <copy file="${basedir}/../core/target/core-${project.version}.jar"
-                                      todir="${dist.dir}" overwrite="true" failonerror="true"/>
-                                <copy file="${basedir}/../woodcutter-plugin/target/woodcutter-plugin-${project.version}.jar"
-                                      todir="${dist.dir}" overwrite="true" failonerror="true"/>
+                                <!-- Example for future plugins (set failonerror to false while developing)
+                                <copy file="${future1.jar}" todir="${stage.dir}" failonerror="false" overwrite="true"/>
+                                -->
 
-                                <!-- Ensure the RuneLite sideload folder exists -->
-                                <mkdir dir="${sideload.dir}"/>
+                                <!-- Ensure RuneLite sideload folder exists -->
+                                <mkdir dir="${runelite.sideload.dir}"/>
+                                <echo>Copying staged jars to: ${runelite.sideload.dir}</echo>
 
-                                <!-- Best-effort copy into RuneLite sideload folder -->
-                                <echo>=== Heist sideload-dist: copying jars to ${sideload.dir}</echo>
-                                <copy file="${basedir}/../core/target/core-${project.version}.jar"
-                                      todir="${sideload.dir}" overwrite="true" failonerror="false"/>
-                                <copy file="${basedir}/../woodcutter-plugin/target/woodcutter-plugin-${project.version}.jar"
-                                      todir="${sideload.dir}" overwrite="true" failonerror="false"/>
-
-                                <echo>=== Heist sideload-dist: done</echo>
+                                <!-- Copy all staged jars to RuneLite sideload folder -->
+                                <copy todir="${runelite.sideload.dir}" overwrite="true">
+                                    <fileset dir="${stage.dir}">
+                                        <include name="*.jar"/>
+                                    </fileset>
+                                </copy>
                             </target>
                         </configuration>
-                        <goals><goal>run</goal></goals>
+                        <goals>
+                            <goal>run</goal>
+                        </goals>
                     </execution>
                 </executions>
             </plugin>

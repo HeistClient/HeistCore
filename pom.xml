@@ -1,101 +1,48 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <!--
-==============================================================================
-PARENT / AGGREGATOR POM  (HeistCore/pom.xml)
-PURPOSE
-  • Build modules (core, woodcutter-plugin, future-plugin-1, sideload-dist).
-  • Centralize versions for child modules.
-  • NO copy logic here (so nothing runs too early). Copying happens in the
-    sideload-dist module after all jars are built.
-USAGE
-  1) Close RuneLite.
-  2) From repo root (HeistCore/): mvn -DskipTests clean verify
-  3) Jars are copied by the sideload-dist module at the end.
-==============================================================================
+  FILE: HeistCore/pom.xml
+  ROLE: Root parent/aggregator for all modules. Declares shared properties
+        (including runelite.version) and lists submodules.
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 
-    <!-- ===== Aggregator coordinates ===== -->
+    <!-- Coordinates that children will inherit -->
     <modelVersion>4.0.0</modelVersion>
-    <groupId>ht.heistcore</groupId>
-    <artifactId>heistcore</artifactId>
+    <groupId>ht.heist</groupId>
+    <artifactId>heist-parent</artifactId>
     <version>1.0-SNAPSHOT</version>
     <packaging>pom</packaging>
+    <name>Heist Parent</name>
 
-    <name>HeistCore</name>
-    <description>Parent project for HeistCore RuneLite plugins</description>
+    <!-- Shared properties (Java level, encoding, and RuneLite version) -->
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-    <!-- ===== Modules (dist last; depends on built jars) ===== -->
-    <modules>
-        <module>core</module>
-        <module>woodcutter-plugin</module>
-        <module>future-plugin-1</module>
-        <module>sideload-dist</module>
-    </modules>
+        <!-- Keep this aligned with the client you run locally -->
+        <runelite.version>1.11.15-SNAPSHOT</runelite.version>
+    </properties>
 
-    <!-- ===== RuneLite repository ===== -->
+    <!-- Repos that provide RuneLite artifacts -->
     <repositories>
         <repository>
             <id>runelite</id>
             <url>https://repo.runelite.net</url>
         </repository>
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
     </repositories>
 
-    <!-- ===== Shared properties ===== -->
-    <properties>
-        <runelite.version>1.10.31</runelite.version>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <maven.compiler.release>11</maven.compiler.release>
-    </properties>
+    <!-- Modules: directory names must exactly match these -->
+    <modules>
+        <module>core-lib</module>
+        <module>heist-hud</module>
+        <module>woodcutter-plugin</module>
+        <module>sideload-dist</module>
+    </modules>
 
-    <!-- ===== Centralized dependency versions for children ===== -->
-    <dependencyManagement>
-        <dependencies>
-            <dependency>
-                <groupId>net.runelite</groupId>
-                <artifactId>client</artifactId>
-                <version>${runelite.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>net.runelite</groupId>
-                <artifactId>runelite-api</artifactId>
-                <version>${runelite.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.apache.commons</groupId>
-                <artifactId>commons-lang3</artifactId>
-                <version>3.12.0</version>
-            </dependency>
-            <dependency>
-                <groupId>com.google.inject</groupId>
-                <artifactId>guice</artifactId>
-                <version>5.1.0</version>
-            </dependency>
-        </dependencies>
-    </dependencyManagement>
-
-    <!-- ===== Plugin versions for children (no executions here) ===== -->
-    <build>
-        <pluginManagement>
-            <plugins>
-                <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-compiler-plugin</artifactId>
-                    <version>3.11.0</version>
-                    <configuration>
-                        <release>${maven.compiler.release}</release>
-                    </configuration>
-                </plugin>
-
-                <!-- Set once so child POMs don't warn about "missing version" -->
-                <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-shade-plugin</artifactId>
-                    <version>3.5.0</version>
-                </plugin>
-            </plugins>
-        </pluginManagement>
-    </build>
 </project>

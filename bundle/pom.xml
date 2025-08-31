@@ -1,116 +1,90 @@
-<!--
-===============================================================================
-FILE: bundle/pom.xml
-PURPOSE
-  Build ONE sideloadable JAR containing BOTH plugins:
-    • Heist Core  (ht.heist.core.*)
-    • Heist Woodcutter (ht.heist.plugins.woodcutter.*)
-  Then stage & (best-effort) copy that shaded jar to your RuneLite folder.
-OUTPUTS
-  • bundle/target/heist-bundle-1.0-SNAPSHOT-all.jar
-  • HeistCore/target/sideload/heist-bundle-1.0-SNAPSHOT-all.jar
-  • C:/Users/barhoo/.runelite/sideloaded-plugins/heist-bundle-1.0-SNAPSHOT-all.jar (best-effort)
-===============================================================================
--->
+<!-- =============================================================================
+POM: bundle (aggregator → fat JAR)
+ROLE:
+  • Produces ONE jar containing:
+      - heist-hud classes + plugin.properties
+      - woodcutter-plugin classes + plugin.properties
+      - core-lib classes
+  • Merges plugin.properties files via shade transformers
+  • Copies final jar into RuneLite sideload folder
+
+RATIONALE:
+  • RuneLite loads EACH plugin jar in its own classloader. If you ship HUD and
+    Woodcutter as separate jars, any static bridge (CoreLocator) is DUPLICATED
+    and not shared. The bundle solves that by delivering one jar so both
+    plugins + core-lib live in the SAME classloader.
+============================================================================= -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-
     <parent>
         <groupId>ht.heistcore</groupId>
         <artifactId>heistcore</artifactId>
         <version>1.0-SNAPSHOT</version>
     </parent>
 
+    <modelVersion>4.0.0</modelVersion>
     <artifactId>heist-bundle</artifactId>
     <packaging>jar</packaging>
-    <name>Heist Bundle (Core + Woodcutter)</name>
 
-    <!-- Depend on the two modules we want to include -->
+    <name>Heist Bundle (HUD + Woodcutter + core-lib)</name>
+
     <dependencies>
         <dependency>
-            <groupId>${project.groupId}</groupId>
-            <artifactId>core</artifactId>
+            <groupId>ht.heistcore</groupId>
+            <artifactId>heist-hud</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
-            <groupId>${project.groupId}</groupId>
+            <groupId>ht.heistcore</groupId>
             <artifactId>woodcutter-plugin</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ht.heistcore</groupId>
+            <artifactId>core-lib</artifactId>
             <version>${project.version}</version>
         </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <!--
-              STEP 1: Shade both module outputs into ONE artifact (classifier = all)
-            -->
+            <!-- Shade both plugins + core-lib into one jar; merge plugin.properties -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.5.0</version>
                 <executions>
                     <execution>
                         <phase>package</phase>
                         <goals><goal>shade</goal></goals>
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
-                            <shadedArtifactAttached>true</shadedArtifactAttached>
-                            <shadedClassifierName>all</shadedClassifierName>
-                            <filters>
-                                <filter>
-                                    <artifact>*:*</artifact>
-                                    <excludes>
-                                        <exclude>META-INF/*.SF</exclude>
-                                        <exclude>META-INF/*.DSA</exclude>
-                                        <exclude>META-INF/*.RSA</exclude>
-                                    </excludes>
-                                </filter>
-                            </filters>
+                            <finalName>heist-bundle-${project.version}-all</finalName>
+                            <transformers>
+                                <!-- Merge multiple plugin.properties into a single resource -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                    <resource>plugin.properties</resource>
+                                </transformer>
+                            </transformers>
                         </configuration>
                     </execution>
                 </executions>
             </plugin>
 
-            <!--
-              STEP 2: Stage & copy the shaded jar (runs AFTER shade within this module)
-              - Stage to parent/target/sideload (always)
-              - Best-effort copy to RuneLite sideload folder (skips if locked)
-            -->
+            <!-- Copy the fat jar into RuneLite sideload folder -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-antrun-plugin</artifactId>
-                <version>3.1.0</version>
                 <executions>
                     <execution>
-                        <id>stage-and-copy-shaded-bundle</id>
+                        <id>copy-to-sideload</id>
                         <phase>package</phase>
                         <configuration>
                             <target>
-                                <!-- Resolve paths -->
-                                <mkdir dir="${project.parent.basedir}/target/sideload"/>
-
-                                <echo>
-                                    Staging shaded bundle:
-                                    ${project.build.directory}/${project.artifactId}-${project.version}-all.jar
-                                    → ${project.parent.basedir}/target/sideload
-                                </echo>
-
-                                <!-- Stage: must succeed -->
-                                <copy
-                                        file="${project.build.directory}/${project.artifactId}-${project.version}-all.jar"
-                                        todir="${project.parent.basedir}/target/sideload"
-                                        overwrite="true"
-                                        failonerror="true"/>
-
-                                <!-- Best-effort copy into RuneLite's sideload folder -->
-                                <echo>Attempting to copy bundle into ${sideload.dir} (skips if locked)...</echo>
-                                <copy
-                                        file="${project.build.directory}/${project.artifactId}-${project.version}-all.jar"
-                                        todir="${sideload.dir}"
-                                        overwrite="true"
-                                        failonerror="false"/>
+                                <mkdir dir="${sideload.dir}"/>
+                                <copy file="${project.build.directory}/heist-bundle-${project.version}-all.jar"
+                                      todir="${sideload.dir}"
+                                      overwrite="true"/>
                             </target>
                         </configuration>
                         <goals><goal>run</goal></goals>
