@@ -1,9 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+==============================================================================
+PARENT / AGGREGATOR POM  (HeistCore/pom.xml)
+PURPOSE
+  • Build modules (core, woodcutter-plugin, future-plugin-1, sideload-dist).
+  • Centralize versions for child modules.
+  • NO copy logic here (so nothing runs too early). Copying happens in the
+    sideload-dist module after all jars are built.
+USAGE
+  1) Close RuneLite.
+  2) From repo root (HeistCore/): mvn -DskipTests clean verify
+  3) Jars are copied by the sideload-dist module at the end.
+==============================================================================
+-->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 
+    <!-- ===== Aggregator coordinates ===== -->
     <modelVersion>4.0.0</modelVersion>
-
     <groupId>ht.heistcore</groupId>
     <artifactId>heistcore</artifactId>
     <version>1.0-SNAPSHOT</version>
@@ -12,12 +27,15 @@
     <name>HeistCore</name>
     <description>Parent project for HeistCore RuneLite plugins</description>
 
+    <!-- ===== Modules (dist last; depends on built jars) ===== -->
     <modules>
         <module>core</module>
         <module>woodcutter-plugin</module>
         <module>future-plugin-1</module>
+        <module>sideload-dist</module>
     </modules>
 
+    <!-- ===== RuneLite repository ===== -->
     <repositories>
         <repository>
             <id>runelite</id>
@@ -25,12 +43,14 @@
         </repository>
     </repositories>
 
+    <!-- ===== Shared properties ===== -->
     <properties>
         <runelite.version>1.10.31</runelite.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>11</maven.compiler.release>
     </properties>
 
+    <!-- ===== Centralized dependency versions for children ===== -->
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -56,6 +76,7 @@
         </dependencies>
     </dependencyManagement>
 
+    <!-- ===== Plugin versions for children (no executions here) ===== -->
     <build>
         <pluginManagement>
             <plugins>
@@ -67,6 +88,8 @@
                         <release>${maven.compiler.release}</release>
                     </configuration>
                 </plugin>
+
+                <!-- Set once so child POMs don't warn about "missing version" -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-shade-plugin</artifactId>

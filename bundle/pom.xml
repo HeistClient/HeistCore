@@ -1,0 +1,122 @@
+<!--
+===============================================================================
+FILE: bundle/pom.xml
+PURPOSE
+  Build ONE sideloadable JAR containing BOTH plugins:
+    • Heist Core  (ht.heist.core.*)
+    • Heist Woodcutter (ht.heist.plugins.woodcutter.*)
+  Then stage & (best-effort) copy that shaded jar to your RuneLite folder.
+OUTPUTS
+  • bundle/target/heist-bundle-1.0-SNAPSHOT-all.jar
+  • HeistCore/target/sideload/heist-bundle-1.0-SNAPSHOT-all.jar
+  • C:/Users/barhoo/.runelite/sideloaded-plugins/heist-bundle-1.0-SNAPSHOT-all.jar (best-effort)
+===============================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>ht.heistcore</groupId>
+        <artifactId>heistcore</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>heist-bundle</artifactId>
+    <packaging>jar</packaging>
+    <name>Heist Bundle (Core + Woodcutter)</name>
+
+    <!-- Depend on the two modules we want to include -->
+    <dependencies>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>woodcutter-plugin</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              STEP 1: Shade both module outputs into ONE artifact (classifier = all)
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.0</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>all</shadedClassifierName>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+              STEP 2: Stage & copy the shaded jar (runs AFTER shade within this module)
+              - Stage to parent/target/sideload (always)
+              - Best-effort copy to RuneLite sideload folder (skips if locked)
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-antrun-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>stage-and-copy-shaded-bundle</id>
+                        <phase>package</phase>
+                        <configuration>
+                            <target>
+                                <!-- Resolve paths -->
+                                <mkdir dir="${project.parent.basedir}/target/sideload"/>
+
+                                <echo>
+                                    Staging shaded bundle:
+                                    ${project.build.directory}/${project.artifactId}-${project.version}-all.jar
+                                    → ${project.parent.basedir}/target/sideload
+                                </echo>
+
+                                <!-- Stage: must succeed -->
+                                <copy
+                                        file="${project.build.directory}/${project.artifactId}-${project.version}-all.jar"
+                                        todir="${project.parent.basedir}/target/sideload"
+                                        overwrite="true"
+                                        failonerror="true"/>
+
+                                <!-- Best-effort copy into RuneLite's sideload folder -->
+                                <echo>Attempting to copy bundle into ${sideload.dir} (skips if locked)...</echo>
+                                <copy
+                                        file="${project.build.directory}/${project.artifactId}-${project.version}-all.jar"
+                                        todir="${sideload.dir}"
+                                        overwrite="true"
+                                        failonerror="false"/>
+                            </target>
+                        </configuration>
+                        <goals><goal>run</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,18 +1,22 @@
 // ============================================================================
-// CursorTracerServiceImpl.java
+// FILE: CursorTracerServiceImpl.java
+// PACKAGE: ht.heist.core.impl
 // -----------------------------------------------------------------------------
-// Purpose
-//   Concrete manager for the core cursor tracer overlay.
-//   - Adds/removes overlay via OverlayManager
-//   - Reads HeistCoreConfig for default visibility
+// PURPOSE
+//   Concrete implementation of CursorTracerService:
+//     • Tracks whether the tracer is enabled.
+//     • Reads HeistCoreConfig in enableIfConfigured().
+// DESIGN
+//   • NO references to CursorTracerOverlay here (critical to avoid
+//     UI↔service circular dependency).
 // ============================================================================
-
 package ht.heist.core.impl;
 
 import ht.heist.core.config.HeistCoreConfig;
 import ht.heist.core.services.CursorTracerService;
-import ht.heist.core.ui.CursorTracerOverlay;
-import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.api.Client;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -20,55 +24,47 @@ import javax.inject.Singleton;
 @Singleton
 public class CursorTracerServiceImpl implements CursorTracerService
 {
-    private final OverlayManager overlayManager;
-    private final HeistCoreConfig cfg;
-    private final CursorTracerOverlay overlay;
+    private static final Logger log = LoggerFactory.getLogger(CursorTracerServiceImpl.class);
 
-    private volatile boolean added = false;
+    private final Client client;
+    private final HeistCoreConfig config;
+
+    private volatile boolean enabled = true;
 
     @Inject
-    public CursorTracerServiceImpl(OverlayManager overlayManager,
-                                   HeistCoreConfig cfg,
-                                   CursorTracerOverlay overlay)
+    public CursorTracerServiceImpl(Client client, HeistCoreConfig config)
     {
-        this.overlayManager = overlayManager;
-        this.cfg = cfg;
-        this.overlay = overlay;
+        this.client  = client;
+        this.config  = config;
+    }
+
+    // -------------------------------------------------------------------------
+    // CursorTracerService API
+    // -------------------------------------------------------------------------
+    @Override
+    public void enable()
+    {
+        enabled = true;
+        log.debug("CursorTracerService: enabled");
     }
 
     @Override
-    public void enableIfConfigured()
+    public void disable()
     {
-        if (cfg.showCursorTracer()) enable();
-        else disable();
-    }
-
-    @Override
-    public synchronized void enable()
-    {
-        if (added) return;
-        overlayManager.add(overlay);
-        added = true;
-    }
-
-    @Override
-    public synchronized void disable()
-    {
-        if (!added) return;
-        overlayManager.remove(overlay);
-        added = false;
-        overlay.clear();
+        enabled = false;
+        log.debug("CursorTracerService: disabled");
     }
 
     @Override
     public boolean isEnabled()
     {
-        return added;
+        return enabled;
     }
 
     @Override
-    public void clear()
+    public void enableIfConfigured()
     {
-        overlay.clear();
+        if (config.showCursorTracer()) enable();
+        else                           disable();
     }
 }

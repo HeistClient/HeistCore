@@ -1,24 +1,29 @@
 // ============================================================================
-// CursorTracerOverlay.java (CORE)
+// FILE: CursorTracerOverlay.java
+// PACKAGE: ht.heist.core.ui
 // -----------------------------------------------------------------------------
-// Purpose
-//   Draw a "fake cursor" ring at the current canvas mouse position and a
-//   fading trail of recent positions. Reads global toggles from HeistCoreConfig.
+// PURPOSE
+//   Draw a cursor ring (and a tiny trail) above ALL UI.
+//   • Reads ring size + trail lifetime from HeistCoreConfig.
+//   • Checks CursorTracerService.isEnabled() to decide whether to render.
+//   • Maintains a small in-overlay trail buffer (no need for service→overlay).
 //
-// Notes
-//   - Overlay lives in CORE so every plugin can reuse it.
-//   - Enabled/disabled via CursorTracerService (adds/removes from OverlayManager).
-//   - Java 11; no Lombok.
+// CRITICAL
+//   setLayer(OverlayLayer.ALWAYS_ON_TOP) => ring/trail are visible over widgets.
+// API EXTRAS
+//   public void clear() => lets other code reset the on-screen trail without
+//   introducing a service→overlay dependency.
 // ============================================================================
-
 package ht.heist.core.ui;
 
 import ht.heist.core.config.HeistCoreConfig;
+import ht.heist.core.services.CursorTracerService;
 import net.runelite.api.Client;
 import net.runelite.api.Point;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -29,85 +34,89 @@ import java.util.Deque;
 @Singleton
 public class CursorTracerOverlay extends Overlay
 {
-    // === Deps ================================================================
+    // --- Injected dependencies ----------------------------------------------
     private final Client client;
+    private final CursorTracerService tracer;
     private final HeistCoreConfig cfg;
 
-    // === Trail buffer ========================================================
-    private static final class Sample {
+    // --- In-overlay trail buffer (no service dependency) ---------------------
+    private static final class TrailPt {
         final int x, y;
-        final long t;
-        Sample(int x, int y, long t) { this.x = x; this.y = y; this.t = t; }
+        final long ts;
+        TrailPt(int x, int y, long ts) { this.x = x; this.y = y; this.ts = ts; }
     }
-    private final Deque<Sample> trail = new ArrayDeque<>(512);
-
-    // === Look & feel =========================================================
-    private static final Color TRAIL_COLOR = new Color(0, 200, 255, 180);
-    private static final Color RING_COLOR  = new Color(0, 200, 255, 220);
-    private static final Stroke TRAIL_STROKE = new BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
-    private static final Stroke RING_STROKE  = new BasicStroke(1.6f);
+    private final Deque<TrailPt> trail = new ArrayDeque<>(64);
 
     @Inject
-    public CursorTracerOverlay(Client client, HeistCoreConfig cfg)
+    public CursorTracerOverlay(Client client, CursorTracerService tracer, HeistCoreConfig cfg)
     {
         this.client = client;
+        this.tracer = tracer;
         this.cfg = cfg;
+
         setPosition(OverlayPosition.DYNAMIC);
-        setLayer(OverlayLayer.ALWAYS_ON_TOP);
+        setPriority(OverlayPriority.HIGH);
+        setLayer(OverlayLayer.ALWAYS_ON_TOP); // draw over inventory/chat/etc.
     }
 
-    /** Clear the trail externally if desired. */
-    public void clear() { trail.clear(); }
+    /** Optional helper: reset the visible trail (does not affect service). */
+    public void clear()
+    {
+        trail.clear();
+    }
 
     @Override
     public Dimension render(Graphics2D g)
     {
-        if (!cfg.showCursorTracer()) return null;
+        if (!cfg.showCursorTracer() || !tracer.isEnabled())
+            return null;
 
-        final Point mp = client.getMouseCanvasPosition();
+        final Point p = client.getMouseCanvasPosition();
+        if (p == null) return null;
+
+        // --- Update trail buffer --------------------------------------------
         final long now = System.currentTimeMillis();
+        final int keepMs = Math.max(0, cfg.tracerTrailMs());
+        trail.addLast(new TrailPt(p.getX(), p.getY(), now));
+        // Drop old points outside of lifetime
+        while (!trail.isEmpty() && (now - trail.peekFirst().ts) > keepMs)
+            trail.removeFirst();
 
-        // Add current point
-        if (mp != null)
+        // --- Draw trail (subtle) ---------------------------------------------
+        if (keepMs > 0 && trail.size() > 1)
         {
-            if (trail.isEmpty() || (trail.getLast().x != mp.getX() || trail.getLast().y != mp.getY()))
+            final Stroke old = g.getStroke();
+            final Composite oldComp = g.getComposite();
+
+            g.setStroke(new BasicStroke(1f));
+            // Fade older samples: newest ~opaque, oldest ~transparent
+            int idx = 0, n = trail.size();
+            TrailPt prev = null;
+            for (TrailPt tp : trail)
             {
-                trail.addLast(new Sample(mp.getX(), mp.getY(), now));
-                if (trail.size() > 512) trail.removeFirst();
+                if (prev != null)
+                {
+                    float alpha = (float)idx / (float)(n - 1);
+                    alpha = Math.max(0.05f, Math.min(1f, alpha)); // clamp
+                    g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+                    g.setColor(Color.WHITE);
+                    g.drawLine(prev.x, prev.y, tp.x, tp.y);
+                }
+                prev = tp;
+                idx++;
             }
+            g.setComposite(oldComp);
+            g.setStroke(old);
         }
 
-        // Drop old samples
-        final long ttlMs = Math.max(100L, cfg.tracerTrailMs());
-        while (!trail.isEmpty() && (now - trail.getFirst().t) > ttlMs) trail.removeFirst();
+        // --- Draw ring at current mouse pos ---------------------------------
+        final int r = Math.max(2, cfg.tracerRingRadiusPx());
+        g.setStroke(new BasicStroke(2f));
+        g.setColor(new Color(255, 255, 255, 220));
+        g.drawOval(p.getX() - r, p.getY() - r, r * 2, r * 2);
 
-        // Draw trail (older = more transparent)
-        g.setStroke(TRAIL_STROKE);
-        Sample prev = null;
-        for (Sample s : trail)
-        {
-            if (prev != null)
-            {
-                float age = (float)(now - s.t) / (float)ttlMs;    // 0..1
-                float alpha = Math.max(0f, 1f - age);
-                Color c = new Color(TRAIL_COLOR.getRed(), TRAIL_COLOR.getGreen(), TRAIL_COLOR.getBlue(),
-                        Math.min(255, (int)(alpha * TRAIL_COLOR.getAlpha())));
-                g.setColor(c);
-                g.drawLine(prev.x, prev.y, s.x, s.y);
-            }
-            prev = s;
-        }
-
-        // Draw ring
-        if (mp != null)
-        {
-            int r = Math.max(2, cfg.tracerRingRadiusPx());
-            int d = r * 2;
-            g.setColor(RING_COLOR);
-            g.setStroke(RING_STROKE);
-            g.drawOval(mp.getX() - r, mp.getY() - r, d, d);
-            g.fillOval(mp.getX() - 1, mp.getY() - 1, 2, 2);
-        }
+        // Subtle center pixel for visibility
+        g.fillRect(p.getX(), p.getY(), 1, 1);
         return null;
     }
 }

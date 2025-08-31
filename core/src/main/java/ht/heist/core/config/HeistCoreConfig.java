@@ -1,15 +1,31 @@
 // ============================================================================
-// HeistCoreConfig.java
+// FILE: HeistCoreConfig.java
+// PACKAGE: ht.heist.core.config
 // -----------------------------------------------------------------------------
-// Purpose
-//   Global core config used by MouseServiceImpl, CameraServiceImpl, and
-//   core UI overlays (CursorTracerOverlay, CoreHeatmapOverlay).
-//   - Mouse timing: tiny settle after MOVE, press/hold, reaction delay
-//   - Human touches: overshoot / fatigue
-//   - Cursor Tracer (global): fake cursor ring + fading trail
-//   - Heatmap (global): tiny dots, hot/cold color mode, optional periodic export
+// PURPOSE
+//   Central configuration for Heist Core (overlays, recorder, exports, timing).
+//
+//   Organized sections:
+//     • Overlays — Heatmap
+//     • Overlays — Cursor Tracer
+//     • Humanizer — Mouse Timing      <-- added for canvasMoveSleep min/max
+//     • Recorder — Human
+//     • Recorder — Macro (Synthetic)
+//     • Exports
+//
+// BUTTON-STYLE TOGGLES
+//   - "Export heatmap now": flip ON -> export -> auto-reset to OFF
+//   - "Export recorder now": flip ON -> save -> auto-reset to OFF
+//
+// PATHS
+//   - recorderOutputPath:       HUMAN JSON output
+//   - recorderExportPathCompat: legacy fallback (used only if Output Path blank)
+//   - recorderSyntheticOutputPath: separate JSON for MACRO clicks
+//
+// NEW (build fix):
+//   - heatmapInfinite(): allows HeatmapServiceImpl to keep points forever
+//   - canvasMoveSleepMinMs()/canvasMoveSleepMaxMs(): used by MouseServiceImpl
 // ============================================================================
-
 package ht.heist.core.config;
 
 import net.runelite.client.config.Config;
@@ -21,259 +37,239 @@ import net.runelite.client.config.ConfigSection;
 public interface HeistCoreConfig extends Config
 {
     // ========================================================================
-    // === Section: Mouse Timing ==============================================
+    // === SECTION: Overlays — Heatmap ========================================
     // ========================================================================
     @ConfigSection(
-            name = "Mouse Timing",
-            description = "Timings to mimic legacy behavior.",
+            name = "Overlays — Heatmap",
+            description = "Click heatmap drawing and export.",
             position = 0
     )
-    String mouseTiming = "mouseTiming";
+    String secHeatmap = "secHeatmap";
 
     @ConfigItem(
-            keyName = "canvasMoveSleepMinMs",
-            name = "Move pause min (ms)",
-            description = "Minimum pause right after MOUSE_MOVED.",
-            position = 1, section = mouseTiming
+            keyName = "showHeatmap",
+            name = "Show click heatmap",
+            description = "Toggle the heatmap overlay on/off.",
+            position = 1,
+            section = secHeatmap
     )
-    default int canvasMoveSleepMinMs() { return 15; }
+    default boolean showHeatmap() { return true; }
 
     @ConfigItem(
-            keyName = "canvasMoveSleepMaxMs",
-            name = "Move pause max (ms)",
-            description = "Maximum pause right after MOUSE_MOVED.",
-            position = 2, section = mouseTiming
+            keyName = "heatmapDotRadiusPx",
+            name = "Dot radius (px)",
+            description = "0 = single pixel; 1 = true 1px dot; etc.",
+            position = 2, section = secHeatmap
     )
-    default int canvasMoveSleepMaxMs() { return 30; }
+    default int heatmapDotRadiusPx() { return 1; }
 
     @ConfigItem(
-            keyName = "pressHoldMinMs",
-            name = "Press hold min (ms)",
-            description = "Minimum duration to hold LMB down.",
-            position = 3, section = mouseTiming
+            keyName = "heatmapFadeMs",
+            name = "Dot fade (ms)",
+            description = "Lifetime in ms; 0 = infinite (no fade).",
+            position = 3, section = secHeatmap
     )
-    default int pressHoldMinMs() { return 30; }
+    default int heatmapFadeMs() { return 0; }
+
+    // *** NEW: explicit infinite flag used by HeatmapServiceImpl ***
+    @ConfigItem(
+            keyName = "heatmapInfinite",
+            name = "Infinite heatmap (no fade)",
+            description = "If ON, dots never fade regardless of 'Dot fade (ms)'.",
+            position = 4, section = secHeatmap
+    )
+    default boolean heatmapInfinite() { return true; }
 
     @ConfigItem(
-            keyName = "pressHoldMaxMs",
-            name = "Press hold max (ms)",
-            description = "Maximum duration to hold LMB down.",
-            position = 4, section = mouseTiming
+            keyName = "heatmapMaxPoints",
+            name = "Max dots in memory",
+            description = "Ring buffer cap to avoid unlimited growth.",
+            position = 5, section = secHeatmap
     )
-    default int pressHoldMaxMs() { return 55; }
+    default int heatmapMaxPoints() { return 4000; }
+
+    enum HeatmapColorMode { MONO, HOT_COLD, INFRARED }
 
     @ConfigItem(
-            keyName = "reactionMeanMs",
-            name = "Reaction mean (ms)",
-            description = "Average delay between MOVE and PRESS.",
-            position = 5, section = mouseTiming
+            keyName = "heatmapColorMode",
+            name = "Color mode",
+            description = "MONO, HOT_COLD, or INFRARED.",
+            position = 6, section = secHeatmap
     )
-    default int reactionMeanMs() { return 120; }
+    default HeatmapColorMode heatmapColorMode() { return HeatmapColorMode.INFRARED; }
 
     @ConfigItem(
-            keyName = "reactionStdMs",
-            name = "Reaction std dev (ms)",
-            description = "Std deviation for the MOVE→PRESS delay.",
-            position = 6, section = mouseTiming
+            keyName = "heatmapExportFolder",
+            name = "Heatmap export folder",
+            description = "Where PNGs are written on export.",
+            position = 7, section = secHeatmap
     )
-    default int reactionStdMs() { return 40; }
+    default String heatmapExportFolder()
+    {
+        return "C:/Users/barhoo/.runelite/heist-heatmaps";
+    }
+
+    @ConfigItem(
+            keyName = "heatmapExportNow",
+            name = "Export heatmap now",
+            description = "Flip ON to export a PNG immediately. Auto-resets.",
+            position = 8, section = secHeatmap
+    )
+    default boolean heatmapExportNow() { return false; }
 
     // ========================================================================
-    // === Section: Human Touches =============================================
+    // === SECTION: Overlays — Cursor Tracer ==================================
     // ========================================================================
     @ConfigSection(
-            name = "Human Touches",
-            description = "Optional human-like behaviors.",
+            name = "Overlays — Cursor Tracer",
+            description = "Fake cursor tracer overlay settings.",
             position = 10
     )
-    String human = "human";
-
-    @ConfigItem(
-            keyName = "enableOvershoot",
-            name = "Enable overshoot",
-            description = "Occasionally overshoot past target then settle back.",
-            position = 11, section = human
-    )
-    default boolean enableOvershoot() { return true; }
-
-    @ConfigItem(
-            keyName = "overshootChancePct",
-            name = "Overshoot chance (%)",
-            description = "Chance per click to overshoot and settle.",
-            position = 12, section = human
-    )
-    default int overshootChancePct() { return 12; } // ~1 in 8
-
-    @ConfigItem(
-            keyName = "enableFatigue",
-            name = "Enable fatigue",
-            description = "Slowly increases delays over session time.",
-            position = 13, section = human
-    )
-    default boolean enableFatigue() { return true; }
-
-    @ConfigItem(
-            keyName = "fatigueMaxPct",
-            name = "Max fatigue (+%)",
-            description = "Max % increase to reaction/hold after long sessions.",
-            position = 14, section = human
-    )
-    default int fatigueMaxPct() { return 20; } // up to +20%
-
-    // ========================================================================
-    // === Section: Cursor Tracer (GLOBAL) ====================================
-    // ========================================================================
-    @ConfigSection(
-            name = "Cursor Tracer",
-            description = "Global fake cursor ring + fading trail (core overlay).",
-            position = 90
-    )
-    String cursorTracer = "cursorTracer";
+    String secTracer = "secTracer";
 
     @ConfigItem(
             keyName = "showCursorTracer",
             name = "Show cursor tracer",
-            description = "Draw a fake cursor ring with a fading trail.",
-            position = 91, section = cursorTracer
+            description = "Toggle the cursor tracer overlay on/off.",
+            position = 11, section = secTracer
     )
     default boolean showCursorTracer() { return true; }
 
     @ConfigItem(
             keyName = "tracerTrailMs",
             name = "Trail lifetime (ms)",
-            description = "How long each tail segment persists before fading out.",
-            position = 92, section = cursorTracer
+            description = "How long tracer segments persist.",
+            position = 12, section = secTracer
     )
     default int tracerTrailMs() { return 900; }
 
     @ConfigItem(
             keyName = "tracerRingRadiusPx",
             name = "Ring radius (px)",
-            description = "Radius of the fake cursor ring drawn at the mouse.",
-            position = 93, section = cursorTracer
+            description = "Radius of the ring drawn at cursor position.",
+            position = 13, section = secTracer
     )
     default int tracerRingRadiusPx() { return 6; }
 
     // ========================================================================
-    // === Section: Heatmap (GLOBAL) ==========================================
+    // === SECTION: Humanizer — Mouse Timing (used by MouseServiceImpl) =======
     // ========================================================================
     @ConfigSection(
-            name = "Heatmap",
-            description = "Global click heatmap (core overlay).",
-            position = 95
+            name = "Humanizer — Mouse Timing",
+            description = "Canvas move stepping micro-sleeps.",
+            position = 15
     )
-    String heatmap = "heatmap";
+    String secTiming = "secTiming";
 
-    // Master toggle
+    // *** NEW: used by MouseServiceImpl.canvasMoveSleepMinMs/MaxMs ***
     @ConfigItem(
-            keyName = "showHeatmap",
-            name = "Show click heatmap",
-            description = "Draw a tiny dot for every mouse click.",
-            position = 96, section = heatmap
+            keyName = "canvasMoveSleepMinMs",
+            name = "Canvas move sleep MIN (ms)",
+            description = "Lower bound of per-step sleep while moving the cursor.",
+            position = 16, section = secTiming
     )
-    default boolean showHeatmap() { return true; }
-
-    // --- Visuals (new names used by core overlay) ----------------------------
-    @ConfigItem(
-            keyName = "heatmapDotSizePx",
-            name = "Dot size (px)",
-            description = "Width/height of each click dot (1 = single pixel).",
-            position = 97, section = heatmap
-    )
-    default int heatmapDotSizePx() { return 1; }
+    default int canvasMoveSleepMinMs() { return 2; }
 
     @ConfigItem(
-            keyName = "heatmapDecayMs",
-            name = "Dot fade (ms)",
-            description = "How long each dot stays visible before fully fading.",
-            position = 98, section = heatmap
+            keyName = "canvasMoveSleepMaxMs",
+            name = "Canvas move sleep MAX (ms)",
+            description = "Upper bound of per-step sleep while moving the cursor.",
+            position = 17, section = secTiming
     )
-    default int heatmapDecayMs() { return 900; }
+    default int canvasMoveSleepMaxMs() { return 6; }
+
+    // ========================================================================
+    // === SECTION: Recorder — Human ==========================================
+    // ========================================================================
+    @ConfigSection(
+            name = "Recorder — Human",
+            description = "Hardware input recorder.",
+            position = 20
+    )
+    String secRecorderHuman = "secRecorderHuman";
 
     @ConfigItem(
-            keyName = "heatmapColdColor",
-            name = "Cold color (hex)",
-            description = "Hex color for low-density areas (e.g. #1e90ff).",
-            position = 99, section = heatmap
+            keyName = "recorderEnabled",
+            name = "Enable human recorder",
+            description = "Start tracking hardware input.",
+            position = 21, section = secRecorderHuman
     )
-    default String heatmapColdColor() { return "#1e90ff"; } // DodgerBlue
+    default boolean recorderEnabled() { return true; }
 
     @ConfigItem(
-            keyName = "heatmapHotColor",
-            name = "Hot color (hex)",
-            description = "Hex color for high-density areas (e.g. #ff4000).",
-            position = 100, section = heatmap
+            keyName = "recorderActivityTag",
+            name = "Activity tag",
+            description = "Label sessions (e.g., DEFAULT, WOODCUTTING).",
+            position = 22, section = secRecorderHuman
     )
-    default String heatmapHotColor() { return "#ff4000"; }  // Orange-Red
+    default String recorderActivityTag() { return "DEFAULT"; }
 
     @ConfigItem(
-            keyName = "heatmapAlpha",
-            name = "Dot alpha (0-255)",
-            description = "Transparency for dots; higher = more opaque.",
-            position = 101, section = heatmap
+            keyName = "recorderOutputPath",
+            name = "Recorder Output Path (human)",
+            description = "Primary JSON path for HUMAN input analytics.",
+            position = 23, section = secRecorderHuman
     )
-    default int heatmapAlpha() { return 200; }
+    default String recorderOutputPath()
+    {
+        return "C:/Users/barhoo/.runelite/heist-input/analytics.json";
+    }
 
     @ConfigItem(
-            keyName = "heatmapMaxPoints",
-            name = "Max dots",
-            description = "Upper bound on stored dots (memory/CPU guard).",
-            position = 102, section = heatmap
+            keyName = "recorderExportPathCompat",
+            name = "Recorder Export Path (compat)",
+            description = "Legacy alias; used only if Output Path is blank.",
+            position = 24, section = secRecorderHuman
     )
-    default int heatmapMaxPoints() { return 20000; }
-
-    enum HeatmapColorMode { MONO, HOT_COLD }
-
-    @ConfigItem(
-            keyName = "heatmapColorMode",
-            name = "Color mode",
-            description = "MONO = one color; HOT_COLD = blue→red by local density.",
-            position = 103, section = heatmap
-    )
-    default HeatmapColorMode heatmapColorMode() { return HeatmapColorMode.HOT_COLD; }
-
-    // --- Export options ------------------------------------------------------
-    @ConfigItem(
-            keyName = "heatmapExportEnabled",
-            name = "Enable periodic export",
-            description = "If enabled, the core heatmap overlay will write out PNG snapshots.",
-            position = 104, section = heatmap
-    )
-    default boolean heatmapExportEnabled() { return false; }
+    default String recorderExportPathCompat()
+    {
+        return "C:/Users/barhoo/.runelite/heist-input/analytics.json";
+    }
 
     @ConfigItem(
-            keyName = "heatmapExportEveryMs",
-            name = "Export interval (ms)",
-            description = "How often to save a heatmap PNG while enabled.",
-            position = 105, section = heatmap
+            keyName = "recorderExportNow",
+            name = "Export recorder now",
+            description = "Flip ON to write the human/synthetic buffers now. Auto-resets.",
+            position = 25, section = secRecorderHuman
     )
-    default int heatmapExportEveryMs() { return 15000; } // 15s
+    default boolean recorderExportNow() { return false; }
+
+    // ========================================================================
+    // === SECTION: Recorder — Macro (Synthetic) ===============================
+    // ========================================================================
+    @ConfigSection(
+            name = "Recorder — Macro",
+            description = "Capture macro (synthetic) clicks separately.",
+            position = 30
+    )
+    String secRecorderMacro = "secRecorderMacro";
 
     @ConfigItem(
-            keyName = "heatmapExportFolder",
-            name = "Export folder",
-            description = "Absolute or relative folder to write PNGs into.",
-            position = 106, section = heatmap
+            keyName = "recordSyntheticClicks",
+            name = "Record macro clicks",
+            description = "If ON, MouseService can send synthetic clicks to the recorder.",
+            position = 31, section = secRecorderMacro
     )
-    default String heatmapExportFolder() { return "heist-heatmaps"; }
-
-    // ------------------------------------------------------------------------
-    // Backward-compat convenience (aliases to old names you previously used)
-    // These keep older code/readers happy while core uses the new names above.
-    // ------------------------------------------------------------------------
-    @ConfigItem(
-            keyName = "heatmapDotRadiusPx",
-            name = "Dot radius (px)",
-            description = "Deprecated: use Dot size (px).",
-            position = 107, section = heatmap
-    )
-    default int heatmapDotRadiusPx() { return Math.max(1, heatmapDotSizePx() / 2); }
+    default boolean recordSyntheticClicks() { return true; }
 
     @ConfigItem(
-            keyName = "heatmapFadeMs",
-            name = "Dot fade (ms) [compat]",
-            description = "Deprecated: use Dot fade (ms) in new section.",
-            position = 108, section = heatmap
+            keyName = "recorderSyntheticOutputPath",
+            name = "Macro Output Path (synthetic)",
+            description = "JSON path for MACRO click analytics.",
+            position = 32, section = secRecorderMacro
     )
-    default int heatmapFadeMs() { return heatmapDecayMs(); }
+    default String recorderSyntheticOutputPath()
+    {
+        return "C:/Users/barhoo/.runelite/heist-input/analytics-synthetic.json";
+    }
+
+    // ========================================================================
+    // === SECTION: Exports (Other) ============================================
+    // ========================================================================
+    @ConfigSection(
+            name = "Exports",
+            description = "Misc one-shot export controls.",
+            position = 40
+    )
+    String secExports = "secExports";
 }
