@@ -1,13 +1,17 @@
 <!--
+  ============================================================================
   FILE: HeistCore/pom.xml
-  ROLE: Root parent/aggregator for all modules. Declares shared properties
-        (including runelite.version) and lists submodules.
+  ROLE: Parent / Aggregator POM
+  PURPOSE:
+    • Defines shared properties (Java 11, encoding, RuneLite version).
+    • Declares repositories (RuneLite, JitPack).
+    • Lists all child modules in build order.
+  ============================================================================
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 
-    <!-- Coordinates that children will inherit -->
     <modelVersion>4.0.0</modelVersion>
     <groupId>ht.heist</groupId>
     <artifactId>heist-parent</artifactId>
@@ -15,17 +19,17 @@
     <packaging>pom</packaging>
     <name>Heist Parent</name>
 
-    <!-- Shared properties (Java level, encoding, and RuneLite version) -->
+    <!-- Shared props for all children -->
     <properties>
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-        <!-- Keep this aligned with the client you run locally -->
+        <!-- Keep this aligned with your local RL client -->
         <runelite.version>1.11.15-SNAPSHOT</runelite.version>
     </properties>
 
-    <!-- Repos that provide RuneLite artifacts -->
+    <!-- Repositories for RL artifacts and (optionally) JitPack -->
     <repositories>
         <repository>
             <id>runelite</id>
@@ -37,12 +41,12 @@
         </repository>
     </repositories>
 
-    <!-- Modules: directory names must exactly match these -->
+    <!-- Modules: exact hierarchy you specified -->
     <modules>
-        <module>core-lib</module>
+        <module>core-java</module>
+        <module>core-rl</module>
         <module>heist-hud</module>
         <module>woodcutter-plugin</module>
         <module>sideload-dist</module>
     </modules>
-
 </project>

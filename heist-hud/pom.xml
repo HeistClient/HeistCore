@@ -1,8 +1,12 @@
 <!--
-  FILE: heist-hud/pom.xml
-  ROLE: RuneLite plugin that draws overlays and records human inputs.
-        It shades core-lib so all ht.heist.corelib classes are inside this JAR.
-        RuneLite deps are provided scope (host supplies them).
+  ============================================================================
+  FILE: HeistCore/heist-hud/pom.xml
+  ROLE: Heist HUD RuneLite plugin (overlays + ingest)
+  PURPOSE:
+    • Depends on core-java (contracts/utilities).
+    • RuneLite dependencies are 'provided' by the host.
+    • Shades core-java into the plugin jar to keep it self-contained.
+  ============================================================================
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -19,17 +23,16 @@
     <artifactId>heist-hud</artifactId>
     <packaging>jar</packaging>
     <name>Heist HUD</name>
-    <description>Overlays and input recorder. Shades core-lib for runtime.</description>
 
     <dependencies>
-        <!-- Shade this into the plugin jar -->
+        <!-- Shade this so the HUD jar is self-contained -->
         <dependency>
             <groupId>ht.heist</groupId>
-            <artifactId>core-lib</artifactId>
+            <artifactId>core-java</artifactId>
             <version>${project.version}</version>
         </dependency>
 
-        <!-- Provided by RuneLite host -->
+        <!-- RuneLite (host-provided) -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
@@ -42,19 +45,11 @@
             <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- Optional: lombok at compile time -->
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <version>1.18.32</version>
-            <scope>provided</scope>
-        </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <!-- Nice jar name -->
+            <!-- Clean jar name -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
@@ -64,7 +59,7 @@
                 </configuration>
             </plugin>
 
-            <!-- Shade ONLY core-lib; keep plugin.properties in the jar root -->
+            <!-- Shade ONLY core-java; never shade RL artifacts -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -76,18 +71,14 @@
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
                             <minimizeJar>true</minimizeJar>
-
-                            <!-- Never include RuneLite or Lombok -->
                             <artifactSet>
                                 <excludes>
                                     <exclude>net.runelite:client</exclude>
                                     <exclude>net.runelite:runelite-api</exclude>
-                                    <exclude>org.projectlombok:lombok</exclude>
                                 </excludes>
                             </artifactSet>
-
                             <transformers>
-                                <!-- Preserve plugin.properties for RuneLite discovery -->
+                                <!-- Keep plugin.properties at jar root for RL discovery -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
                                     <resource>plugin.properties</resource>
                                 </transformer>
@@ -98,5 +89,4 @@
             </plugin>
         </plugins>
     </build>
-
 </project>

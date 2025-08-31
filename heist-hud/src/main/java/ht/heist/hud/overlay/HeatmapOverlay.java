@@ -3,89 +3,109 @@
 // PACKAGE: ht.heist.hud.overlay
 // -----------------------------------------------------------------------------
 // TITLE
-//   Infrared Heatmap Overlay — draws two layers on top of all UI.
-//   • Persistent layer: infinite memory, filtered by ingest toggles.
-//   • Live layer: last N ms (cfg.liveDecayMs), also filtered by ingest toggles.
+//   Heatmap overlay — draws persistent + live taps. Supports infrared palette.
 //
-// Z-ORDER
-//   ALWAYS_ON_TOP so it remains visible over inventory/widgets.
+// DRAWING MODEL
+//   • Persistent: small semi-opaque base dots
+//   • Live: stronger dots with color by intensity (age-based)
 // ============================================================================
-
 package ht.heist.hud.overlay;
 
 import ht.heist.hud.HeistHUDConfig;
+import ht.heist.hud.service.HeatPoint;
 import ht.heist.hud.service.HeatmapService;
 import net.runelite.api.Client;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.OverlayPriority;
 
 import javax.inject.Inject;
-import javax.inject.Singleton;
 import java.awt.*;
 import java.util.List;
 
-@Singleton
 public class HeatmapOverlay extends Overlay
 {
     private final Client client;
-    private final HeatmapService heatmap;
     private final HeistHUDConfig cfg;
+    private final HeatmapService svc;
 
     @Inject
-    public HeatmapOverlay(Client client, HeatmapService heatmap, HeistHUDConfig cfg)
+    public HeatmapOverlay(Client client, HeistHUDConfig cfg, HeatmapService svc)
     {
-        this.client  = client;
-        this.heatmap = heatmap;
-        this.cfg     = cfg;
+        this.client = client;
+        this.cfg = cfg;
+        this.svc = svc;
 
         setPosition(OverlayPosition.DYNAMIC);
-        setPriority(OverlayPriority.HIGH);
-        setLayer(OverlayLayer.ALWAYS_ON_TOP);
+        setLayer(OverlayLayer.ABOVE_SCENE);
+        setPriority(50);
     }
 
     @Override
     public Dimension render(Graphics2D g)
     {
-        final int r   = Math.max(0, cfg.heatmapDotRadiusPx());
-        final long now = System.currentTimeMillis();
+        if (!cfg.showHeatmap()) return null;
 
-        // Persistent (infinite)
+        final int r = Math.max(1, cfg.heatmapDotRadiusPx());
+
+        // Persistent layer (optional)
         if (cfg.showPersistentLayer())
         {
-            List<HeatmapService.Sample> ps = heatmap.snapshotPersistent();
-            for (HeatmapService.Sample s : ps) {
-                g.setColor(infraredColor(now - s.ts, Math.max(1, cfg.liveDecayMs())));
-                drawDot(g, s.x, s.y, r);
-            }
+            final List<HeatPoint> all = svc.getPersistent();
+            final Color base = new Color(255, 0, 0, 50); // pale red base
+            for (HeatPoint p : all)
+                fillCircle(g, base, p.getX(), p.getY(), r);
         }
 
-        // Live (decayed window)
-        if (cfg.showLiveLayer())
+        // Live layer (age → intensity color)
+        final long now = System.currentTimeMillis();
+        final List<HeatPoint> live = svc.getLive(now, cfg.liveDecayMs());
+        for (HeatPoint p : live)
         {
-            List<HeatmapService.Sample> ls = heatmap.snapshotLive(now, cfg.liveDecayMs());
-            for (HeatmapService.Sample s : ls) {
-                g.setColor(infraredColor(now - s.ts, Math.max(1, cfg.liveDecayMs())));
-                drawDot(g, s.x, s.y, r);
-            }
+            double t = 1.0 - Math.min(1.0, (now - p.getTs()) / (double) cfg.liveDecayMs());
+            Color c = heatColor(t);
+            fillCircle(g, c, p.getX(), p.getY(), r + 1);
         }
+
         return null;
     }
 
-    private static void drawDot(Graphics2D g, int x, int y, int r)
+    // ---- Helpers ------------------------------------------------------------
+
+    private static void fillCircle(Graphics2D g, Color c, int x, int y, int r)
     {
-        if (r <= 0) g.fillRect(x, y, 1, 1);
-        else        g.fillOval(x - r, y - r, r * 2 + 1, r * 2 + 1);
+        g.setColor(c);
+        g.fillOval(x - r, y - r, r * 2, r * 2);
     }
 
-    private static Color infraredColor(long ageMs, int decayMs)
+    /** Infrared palette if enabled; otherwise alpha-scaled red. */
+    private Color heatColor(double intensity)
     {
-        if (decayMs <= 0) decayMs = 1;
-        float t = (float)Math.max(0, Math.min(1, (double)ageMs / (double)decayMs));
-        float r = 1.0f;
-        float g = 1.0f - 0.8f * t;     // 1 → 0.2
-        float b = 0.2f * (1.0f - t);   // 0.2 → 0
-        return new Color(r, g, b);
+        if (!cfg.heatmapInfraredPalette())
+        {
+            int a = clamp((int) Math.round(40 + 180 * intensity), 0, 255);
+            return new Color(255, 0, 0, a);
+        }
+
+        double t = Math.max(0, Math.min(1, intensity));
+        Color[] stops = {
+                new Color(  0,   0, 255), // blue
+                new Color(  0, 255, 255), // cyan
+                new Color(  0, 255,   0), // green
+                new Color(255, 255,   0), // yellow
+                new Color(255,   0,   0)  // red
+        };
+        double pos = t * (stops.length - 1);
+        int i = (int) Math.floor(pos);
+        int j = Math.min(stops.length - 1, i + 1);
+        double u = pos - i;
+
+        int r = (int) Math.round(stops[i].getRed()   * (1 - u) + stops[j].getRed()   * u);
+        int g = (int) Math.round(stops[i].getGreen() * (1 - u) + stops[j].getGreen() * u);
+        int b = (int) Math.round(stops[i].getBlue()  * (1 - u) + stops[j].getBlue()  * u);
+        int a = (int) Math.round(60 + 195 * t);
+        return new Color(r, g, b, clamp(a, 0, 255));
     }
+
+    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 }

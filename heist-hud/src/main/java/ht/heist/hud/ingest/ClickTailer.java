@@ -1,203 +1,124 @@
 // ============================================================================
 // FILE: ClickTailer.java
 // PACKAGE: ht.heist.hud.ingest
-// -----------------------------------------------------------------------------
-// TITLE
-//   JSONL Click Tailer — ingests synthetic taps written by other plugins.
+// TITLE: ClickTailer — tails JSONL of synthetic taps and invokes a callback
 //
-// WHAT IT DOES
-//   • Opens (or waits for) the synthetic JSONL file
-//     (default: ${user.home}/.runelite/heist-input/clicks.jsonl)
-//   • Tails NEW lines (starts at end of file to avoid historical spam)
-//   • For each JSON line, parses {ts,x,y,source} and calls:
-//       heatmap.addSyntheticTap(x, y, ts)
+// FORMAT (one JSON object per line):
+//   {"x":123,"y":456,"ts":1712345678901}
 //
-// RELATIONSHIP TO CONFIG
-//   • Obeys ONLY cfg.ingestSynthetic(): when OFF, events are skipped but we
-//     keep the tailer running so toggling ON starts showing instantly.
-//   • Path comes from cfg.syntheticClicksJsonlPath().
-//
-// ROBUSTNESS
-//   • Handles file creation later, rotation (size shrink), and errors quietly.
-//   • Parsing is lightweight (no JSON deps). We scan for keys manually.
+// CALLBACK
+// • TapConsumer.accept(x, y, ts) on the RuneLite client thread.
+// • "~" in paths expands to user.home.
 //
 // THREADING
-//   • Background daemon thread. start()/stop() are idempotent.
+// • Dedicated daemon thread; safe stop() via interrupt flag.
 // ============================================================================
 package ht.heist.hud.ingest;
 
-import ht.heist.hud.HeistHUDConfig;
-import ht.heist.hud.service.HeatmapService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import net.runelite.client.callback.ClientThread;
 
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.io.File;
-import java.io.RandomAccessFile;
+import java.io.BufferedReader;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-@Singleton
-public class ClickTailer
-{
-    private static final Logger log = LoggerFactory.getLogger(ClickTailer.class);
+public final class ClickTailer implements Runnable {
 
-    private final HeistHUDConfig cfg;
-    private final HeatmapService heatmap;
+    // Functional callback for parsed taps
+    public interface TapConsumer { void accept(int x, int y, long ts); }
 
-    private volatile Thread worker;
-    private volatile boolean running;
+    private final ClientThread clientThread;
+    private final TapConsumer onTap;
+    private final Path path;
 
-    @Inject
-    public ClickTailer(HeistHUDConfig cfg, HeatmapService heatmap)
-    {
-        this.cfg = cfg;
-        this.heatmap = heatmap;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private Thread thread;
+
+    public ClickTailer(ClientThread clientThread, String jsonlPath, TapConsumer onTap) {
+        this.clientThread = clientThread;
+        this.onTap = onTap;
+        this.path = expandTilde(jsonlPath);
     }
 
-    // -------------------------------------------------------------------------
-    // Lifecycle
-    // -------------------------------------------------------------------------
-    public synchronized void start()
-    {
-        if (running) return;
-        running = true;
-        worker = new Thread(this::runLoop, "HeistHUD-ClickTailer");
-        worker.setDaemon(true);
-        worker.start();
-        log.info("ClickTailer started (path={})", cfg.syntheticClicksJsonlPath());
+    public void start() {
+        if (running.getAndSet(true)) return;
+        thread = new Thread(this, "Heist-ClickTailer");
+        thread.setDaemon(true);
+        thread.start();
     }
 
-    public synchronized void stop()
-    {
-        running = false;
-        if (worker != null)
-        {
-            try { worker.join(500); } catch (InterruptedException ignored) {}
-            worker = null;
-        }
-        log.info("ClickTailer stopped");
+    public void stop() {
+        running.set(false);
+        if (thread != null) thread.interrupt();
     }
 
-    // -------------------------------------------------------------------------
-    // Tail loop
-    // -------------------------------------------------------------------------
-    private void runLoop()
-    {
-        String path = cfg.syntheticClicksJsonlPath();
+    @Override
+    public void run() {
+        try {
+            Path parent = path.getParent();
+            if (parent != null && !Files.exists(parent)) Files.createDirectories(parent);
+            if (!Files.exists(path)) Files.createFile(path);
+        } catch (IOException ignored) {}
 
-        RandomAccessFile raf = null;
-        long fp = 0L; // file pointer
+        try (BufferedReader br = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            // consume existing lines
+            while (running.get() && br.readLine() != null) { /* seek to end */ }
 
-        while (running)
-        {
-            try
-            {
-                // Wait for file to exist
-                File f = new File(path);
-                if (!f.exists())
-                {
-                    sleep(300);
+            // tail new lines
+            String line;
+            while (running.get()) {
+                line = br.readLine();
+                if (line == null) {
+                    try { Thread.sleep(150); } catch (InterruptedException e) { /* exit soon */ }
                     continue;
                 }
-
-                // Open if needed
-                if (raf == null)
-                {
-                    raf = new RandomAccessFile(f, "r");
-                    // Start at END to only process new taps from now on
-                    fp = f.length();
-                    raf.seek(fp);
+                final int[] xyz = parseLine(line);
+                if (xyz != null) {
+                    final int x = xyz[0], y = xyz[1];
+                    final long ts = ((long) xyz[2]) & 0xFFFFFFFFL; // we packed into int parse; recover
+                    clientThread.invokeLater(() -> onTap.accept(x, y, ts));
                 }
-
-                // Detect rotation/shrink
-                long len = f.length();
-                if (len < fp)
-                {
-                    // file truncated — reopen and seek to end
-                    try { raf.close(); } catch (Exception ignored) {}
-                    raf = new RandomAccessFile(f, "r");
-                    fp = f.length();
-                    raf.seek(fp);
-                }
-
-                // Read new lines if any
-                String line;
-                while (running && (line = raf.readLine()) != null)
-                {
-                    fp = raf.getFilePointer();
-                    handleLine(line);
-                }
-
-                // idle a bit
-                sleep(60);
             }
-            catch (Throwable t)
-            {
-                // Never crash; try again shortly.
-                sleep(300);
-            }
-            finally
-            {
-                // Note: we keep the file open while running to reduce overhead.
-                // We only close on rotation or on stop().
-            }
-        }
-
-        if (raf != null) {
-            try { raf.close(); } catch (Exception ignored) {}
-        }
+        } catch (IOException ignored) { }
     }
 
-    private void handleLine(String raw)
-    {
-        // Respect ONLY the synthetic ingest toggle.
-        if (!cfg.ingestSynthetic()) return;
-        if (raw == null || raw.isEmpty()) return;
-
-        // RandomAccessFile.readLine() returns ISO-8859-1 encoded strings.
-        // Convert bytes → UTF-8 safely (clicks JSON is ASCII anyway).
-        byte[] bytes = raw.getBytes(StandardCharsets.ISO_8859_1);
-        String line = new String(bytes, StandardCharsets.UTF_8).trim();
-
-        // Very small JSONL parser: we just pull numbers for ts, x, y.
-        // Expected:
-        // {"ts": 1725074797651, "x": 532, "y": 248, "source": "synthetic"}
+    // extremely small parser to avoid pulling a JSON lib
+    private static int[] parseLine(String s) {
         try {
-            long ts = extractLong(line, "\"ts\"");
-            int  x  = (int)extractLong(line, "\"x\"");
-            int  y  = (int)extractLong(line, "\"y\"");
-            // Source can be ignored for the heatmap.
-            heatmap.addSyntheticTap(x, y, ts);
-        } catch (Exception ignored) {
-            // Ignore malformed lines silently.
+            int xi = s.indexOf("\"x\":");
+            int yi = s.indexOf("\"y\":");
+            int ti = s.indexOf("\"ts\":");
+            if (xi < 0 || yi < 0) return null;
+
+            int xStart = xi + 4; int xEnd = xStart;
+            while (xEnd < s.length() && Character.isDigit(s.charAt(xEnd))) xEnd++;
+            int x = Integer.parseInt(s.substring(xStart, xEnd));
+
+            int yStart = yi + 4; int yEnd = yStart;
+            while (yEnd < s.length() && Character.isDigit(s.charAt(yEnd))) yEnd++;
+            int y = Integer.parseInt(s.substring(yStart, yEnd));
+
+            long ts = System.currentTimeMillis();
+            if (ti >= 0) {
+                int tStart = ti + 5; int tEnd = tStart;
+                while (tEnd < s.length() && Character.isDigit(s.charAt(tEnd))) tEnd++;
+                try { ts = Long.parseLong(s.substring(tStart, tEnd)); } catch (NumberFormatException ignore) { }
+            }
+
+            // return x, y, and lower 32 bits of ts (packed into int)
+            return new int[]{x, y, (int)(ts & 0xFFFFFFFFL)};
+        } catch (Exception e) {
+            return null;
         }
     }
 
-    // Simple extractor: finds "<key>": <number>
-    private static long extractLong(String s, String key)
-    {
-        int i = s.indexOf(key);
-        if (i < 0) throw new IllegalArgumentException("key not found");
-        i = s.indexOf(':', i);
-        if (i < 0) throw new IllegalArgumentException("colon not found");
-        i++;
-        // skip spaces
-        while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
-        // read sign+digits
-        int j = i;
-        while (j < s.length())
-        {
-            char c = s.charAt(j);
-            if (!(c == '-' || (c >= '0' && c <= '9'))) break;
-            j++;
+    private static Path expandTilde(String p) {
+        if (p == null || p.isEmpty()) return Paths.get(System.getProperty("user.home"));
+        if (p.equals("~")) return Paths.get(System.getProperty("user.home"));
+        if (p.startsWith("~/") || p.startsWith("~\\")) {
+            return Paths.get(System.getProperty("user.home"), p.substring(2));
         }
-        if (j == i) throw new IllegalArgumentException("no number");
-        return Long.parseLong(s.substring(i, j));
-    }
-
-    private static void sleep(long ms)
-    {
-        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+        return Paths.get(p);
     }
 }

@@ -3,46 +3,49 @@
 // PACKAGE: ht.heist.plugins.woodcutter
 // -----------------------------------------------------------------------------
 // TITLE
-//   Thin Woodcutter — **EXACT** click sequence restored (old working logic).
+//   Heist Woodcutter (Thin Controller) — tree detect → delegate human click
 //
-// WHAT THIS VERSION DOES (MATCHES YOUR OLD MouseServiceImpl ORDER):
-//   1) (rare) MISCLICK branch:
-//        - Move to a nearby "miss" point
-//        - Gaussian reaction delay
-//        - Click miss
-//        - Correction delay
-//        - Continue to final approach
-//   2) (sometimes) OVERSHOOT branch:
-//        - Move to a slight overshoot past target
-//        - Short settle
-//        - Continue to final approach
-//   3) FINAL APPROACH:
-//        - Move along a curved path to the true target
-//        - Gaussian reaction delay
-//        - Log synthetic tap (so HUD shows it even if human ingest is off)
-//        - Click with short hold
+// OVERVIEW
+//   This plugin keeps gameplay logic *thin* and pushes all mouse “humanization”
+//   into core-rl’s HumanMouse (curved move → reaction-before-press → short hold).
 //
-// IMPORTANT:
-//   • MouseGateway is purely an AWT dispatcher (no dwell/reaction inside).
-//   • All sleeps/timing here mirror your old constants.
-//   • Path generation stays in core-lib MousePlannerImpl (curves + step pacing).
+//   Responsibilities in THIS class:
+//     • Find a nearby tree that matches the selected TreeType.
+//     • Ask HumanMouse to click the GameObject’s convex hull (non-teleporting).
+//     • Verify chopping by watching for the axe animation.
+//     • When inventory is full, drop logs using HumanMouse.clickRect(...) with
+//       Shift held (assumes player has OSRS “Shift-drop” enabled).
+//     • Publish a synthetic-tap sink so every click is written to clicks.jsonl.
 //
-// NOTES:
-//   • We do *not* block the client thread for too long in practice; this is
-//     the same pattern as your original working implementation.
-//   • If you prefer fully async dispatch (like your old executor), we can
-//     re-wrap these sequences on a single worker thread — but first let’s
-//     validate the behavior is perfect again.
+//   What it DOES NOT do here (by design):
+//     • Build mouse paths, hover, reaction, or press timing (handled by core-rl).
+//     • Dispatch AWT events directly (core-rl/MouseGateway does that).
+//
+// DEPENDENCIES
+//   • HumanMouse (ht.heist.corerl.input.HumanMouse) — provides:
+//       - clickHull(Shape hull, boolean shift)
+//       - clickRect(Rectangle rect, boolean shift)
+//       - setTapSink(Consumer<Point> sink)
+//   • TreeDetector (ht.heist.corerl.object.TreeDetector) — findNearest(Client, TreeType)
+//   • SyntheticTapLogger (ht.heist.plugins.woodcutter.io.SyntheticTapLogger) — writes JSONL
+//
+// PLACEMENT
+//   HeistCore/woodcutter-plugin/src/main/java/ht/heist/plugins/woodcutter/WoodcutterPlugin.java
+//
+// RUNTIME NOTES
+//   • All clicks are queued on HumanMouse’s single-thread executor; we just
+//     “set wakeAt” here to give the worker time before verifying state.
+//   • Yellow-click protection comes from the reaction-before-press inside
+//     HumanMouse (not from sleeps in this plugin).
 // ============================================================================
 
 package ht.heist.plugins.woodcutter;
 
 import com.google.inject.Provides;
-import ht.heist.corelib.human.Humanizer;
-import ht.heist.corelib.human.HumanizerImpl;
-import ht.heist.corelib.io.SyntheticTapLogger;
-import ht.heist.corelib.mouse.MousePlanner;
-import ht.heist.corelib.mouse.MousePlannerImpl;
+import ht.heist.corerl.input.HumanMouse;
+import ht.heist.corerl.object.TreeDetector;
+import ht.heist.corerl.object.TreeType;
+import ht.heist.plugins.woodcutter.io.SyntheticTapLogger;
 import net.runelite.api.*;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.widgets.Widget;
@@ -56,315 +59,232 @@ import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import java.awt.*;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Random;
 
 @PluginDescriptor(
         name = "Heist Woodcutter",
-        description = "Cuts trees with human-like movement & logs synthetic taps for the HUD.",
-        tags = {"heist", "woodcutting"}
+        description = "Thin tree-cutting controller that delegates red-click behavior to core-rl HumanMouse.",
+        tags = {"heist","woodcutting"}
 )
 public class WoodcutterPlugin extends Plugin
 {
     // ----- Logging ------------------------------------------------------------
     private static final Logger log = LoggerFactory.getLogger(WoodcutterPlugin.class);
 
-    // ----- Injected RL deps ---------------------------------------------------
+    // ----- Injected deps ------------------------------------------------------
     @Inject private Client client;
-    @Inject private ConfigManager configManager;
     @Inject private WoodcutterConfig config;
+    @Inject private HumanMouse humanMouse;
 
-    // ----- Mouse I/O ----------------------------------------------------------
-    @Inject private MouseGateway mouse;        // AWT dispatcher (no dwell/reaction inside)
-    private MousePlanner planner;              // path/hold/step timings (core-lib)
-
-    // ----- Humanizer (for small random delays when needed) --------------------
-    private final Humanizer human = new HumanizerImpl();
-    private final Random rng = new Random();
-
-    // ===== Old constants (copied from your working MouseServiceImpl) ==========
-    private static final int REACT_MEAN = 120;          // gaussian reaction (pre-press)
-    private static final int REACT_STD  = 40;
-    private static final int HOLD_MIN   = 30;           // short hold
-    private static final int HOLD_MAX   = 55;
-
-    private static final int  OVERSHOOT_CHANCE_PCT = 12;  // sometimes overshoot
-    private static final int  MISCLICK_CHANCE_PCT  = 3;   // rare misclick
-    private static final int  MISCLICK_OFFSET_MIN  = 8;
-    private static final int  MISCLICK_OFFSET_MAX  = 16;
-    private static final int  CORRECTION_DELAY_MIN = 80;
-    private static final int  CORRECTION_DELAY_MAX = 160;
-
-    // ===== State machine ======================================================
-    private enum State { STARTING, FINDING_TREE, VERIFYING, CHOPPING, INVENTORY }
+    // ----- Simple state machine ----------------------------------------------
+    private enum State { STARTING, FINDING_TREE, VERIFYING_CHOP_START, CHOPPING, INVENTORY_DROP }
     private State state = State.STARTING;
-    private long wakeAt = 0L;
 
-    private GameObject targetTree;
+    /** Wake gate so we don’t spam on every tick while HumanMouse works. */
+    private long wakeAtMs = 0L;
+
+    /** Remember the last target so we can blacklist if desired (optional). */
+    private GameObject targetTree = null;
 
     // =========================================================================
-    // LIFECYCLE
+    // PLUGIN LIFECYCLE
     // =========================================================================
+    @Provides
+    WoodcutterConfig provideConfig(ConfigManager cm) {
+        return cm.getConfig(WoodcutterConfig.class);
+    }
+
     @Override
     protected void startUp()
     {
-        planner = new MousePlannerImpl();
-        state   = State.FINDING_TREE;
-        log.info("Heist Woodcutter started");
+        // Wire the tap sink exactly once: every synthetic tap from HumanMouse
+        // is written to a JSONL file (user-profile-safe path in the logger).
+        humanMouse.setTapSink(p -> {
+            try { SyntheticTapLogger.log(p.x, p.y); }
+            catch (Throwable t) { /* never break gameplay on I/O */ }
+        });
+
+        state = State.FINDING_TREE;
+        log.info("[Heist-WC] started (thin controller).");
     }
 
     @Override
     protected void shutDown()
     {
-        planner = null;
-        log.info("Heist Woodcutter stopped");
+        log.info("[Heist-WC] stopped.");
     }
 
     // =========================================================================
-    // GAME LOOP
+    // MAIN LOOP — driven by RuneLite ticks, not blocking the client thread
     // =========================================================================
     @Subscribe
     public void onGameTick(GameTick tick)
     {
-        if (System.currentTimeMillis() < wakeAt) return;
+        // Respect the wake gate set after we schedule a human click.
+        if (System.currentTimeMillis() < wakeAtMs) return;
 
+        // Sanity checks
+        if (client.getGameState() != GameState.LOGGED_IN) return;
         final Player me = client.getLocalPlayer();
-        if (client.getGameState() != GameState.LOGGED_IN || me == null || planner == null) return;
+        if (me == null) return;
+
+        // If the inventory is full, pivot into drop mode immediately.
+        if (state != State.INVENTORY_DROP && isInventoryFull()) {
+            log.debug("[Heist-WC] inventory appears full → dropping logs");
+            state = State.INVENTORY_DROP;
+        }
 
         switch (state)
         {
             case STARTING:
             case FINDING_TREE:
             {
-                targetTree = findNearestTree(config.treeType().getId());
+                // Try the configured type first…
+                targetTree = TreeDetector.findNearest(client, config.treeType());
+
+                // …and if none found (e.g., willow IDs vary regionally), gracefully
+                // fall back to ANY so the user still gets behavior instead of a stall.
+                if (targetTree == null && config.treeType() != TreeType.ANY) {
+                    targetTree = TreeDetector.findNearest(client, TreeType.ANY);
+                    if (targetTree != null) {
+                        log.debug("[Heist-WC] fallback: using ANY tree (no {} nearby).", config.treeType());
+                    }
+                }
+
                 if (targetTree == null)
                 {
-                    sleep(600, 800);
+                    // Nothing to do — check again shortly.
+                    wakeAtMs = System.currentTimeMillis() + 600;
+                    break;
+                }
+
+                // Ask core-rl to perform the human-like click on the hull.
+                final Shape hull = targetTree.getConvexHull();
+                if (hull != null)
+                {
+                    log.debug("[Heist-WC] queue hull click (type={}, id={}, loc={})",
+                            config.treeType(), targetTree.getId(), targetTree.getWorldLocation());
+
+                    humanMouse.clickHull(hull, /*shift=*/false);
+
+                    // Give the worker a moment to move → react → press, then verify.
+                    state = State.VERIFYING_CHOP_START;
+                    wakeAtMs = System.currentTimeMillis() + 1000;
                 }
                 else
                 {
-                    clickGameObjectHull(targetTree);
-                    state = State.VERIFYING;
-                    sleep(800, 1200);
+                    // Hull missing (off-canvas or obstructed) — retry soon.
+                    wakeAtMs = System.currentTimeMillis() + 400;
                 }
                 break;
             }
 
-            case VERIFYING:
+            case VERIFYING_CHOP_START:
             {
-                if (me.getAnimation() == currentAxeAnim()) state = State.CHOPPING;
-                else if (!isMoving(me))                     state = State.FINDING_TREE;
+                // If the axe animation starts, we’re successfully chopping.
+                if (me.getAnimation() == currentAxeAnimation()) {
+                    state = State.CHOPPING;
+                    break;
+                }
+
+                // If we’re not moving and didn’t start chopping, try again.
+                if (!isMoving(me)) {
+                    state = State.FINDING_TREE;
+                }
                 break;
             }
 
             case CHOPPING:
             {
-                if (me.getAnimation() != currentAxeAnim()) state = State.FINDING_TREE;
-                if (isInventoryFull())                     state = State.INVENTORY;
+                // When chopping stops or the tree despawns, go find another.
+                if (me.getAnimation() != currentAxeAnimation()) {
+                    state = State.FINDING_TREE;
+                }
                 break;
             }
 
-            case INVENTORY:
+            case INVENTORY_DROP:
             {
-                if (config.logHandling() == WoodcutterConfig.LogHandling.DROP)
-                    dropOneLogIfPresent();
-                else
-                    burnOneLogIfPossible();
-                state = State.FINDING_TREE;
+                // Drop one stack of logs per tick until none remain.
+                if (!dropOneLogWithShift()) {
+                    // All gone — back to finding trees.
+                    state = State.FINDING_TREE;
+                }
+                // Small pacing so the drops don’t happen “all at once”.
+                wakeAtMs = System.currentTimeMillis() + 180;
                 break;
             }
         }
     }
 
     // =========================================================================
-    // CLICK PIPELINE — EXACT OLD ORDER
+    // INVENTORY HELPERS — minimal & robust
     // =========================================================================
-    private void clickGameObjectHull(GameObject obj)
-    {
-        final Shape hull = (obj != null) ? obj.getConvexHull() : null;
-        if (hull == null) return;
 
-        // 1) Pick a biased point inside the hull’s bounds (same sampler as before)
-        final Rectangle r = hull.getBounds();
-        final java.awt.Point target = human.sampleEllipticalInRect(r, 0.32, 0.36, 0, 0);
-
-        // 2) Determine current mouse position as "from" (fallback to target)
-        final net.runelite.api.Point mp = client.getMouseCanvasPosition();
-        java.awt.Point from = (mp != null) ? new java.awt.Point(mp.getX(), mp.getY()) : target;
-
-        try
-        {
-            // --- MISCLICK branch (rare) --------------------------------------
-            if (roll(MISCLICK_CHANCE_PCT))
-            {
-                final java.awt.Point miss = offsetAround(target, MISCLICK_OFFSET_MIN, MISCLICK_OFFSET_MAX);
-
-                // Move to MISS
-                MousePlanner.MousePlan p1 = planner.plan(from, miss);
-                mouse.moveAlong(p1.path(), p1.stepDelayMinMs(), p1.stepDelayMaxMs(), false);
-
-                // Reaction BEFORE miss click (gaussian)
-                sleepGaussian(REACT_MEAN, REACT_STD);
-
-                // Click the miss
-                mouse.clickAt(miss, HOLD_MIN, HOLD_MAX, false);
-
-                // Correction delay, then continue from miss
-                sleep(CORRECTION_DELAY_MIN, CORRECTION_DELAY_MAX);
-                from = miss;
-            }
-            // --- OVERSHOOT branch (sometimes) --------------------------------
-            else if (roll(OVERSHOOT_CHANCE_PCT))
-            {
-                final java.awt.Point over = overshootPoint(target);
-
-                // Move to OVERSHOOT point
-                MousePlanner.MousePlan p1 = planner.plan(from, over);
-                mouse.moveAlong(p1.path(), p1.stepDelayMinMs(), p1.stepDelayMaxMs(), false);
-
-                // Short settle (same feel as old)
-                sleep(18, 35);
-                from = over;
-            }
-
-            // --- FINAL APPROACH (always) -------------------------------------
-            MousePlanner.MousePlan p2 = planner.plan(from, target);
-            mouse.moveAlong(p2.path(), p2.stepDelayMinMs(), p2.stepDelayMaxMs(), false);
-
-            // Gaussian reaction BEFORE the real press (this is critical)
-            sleepGaussian(REACT_MEAN, REACT_STD);
-
-            // Publish the actual tap for the HUD (tailer will ingest)
-            SyntheticTapLogger.log(target.x, target.y);
-
-            // Short hold click (same as old)
-            mouse.clickAt(target, HOLD_MIN, HOLD_MAX, false);
-        }
-        catch (InterruptedException ie)
-        {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    // =========================================================================
-    // INVENTORY HELPERS (unchanged)
-    // =========================================================================
+    /** Returns true if the inventory container exists and has 28 items. */
     private boolean isInventoryFull()
     {
-        ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
+        final ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
         return inv != null && inv.count() >= 28;
     }
 
-    private void dropOneLogIfPresent()
+    /**
+     * Finds the first inventory widget that looks like a log and Shift-drops it.
+     *
+     * Shift must be configured in the OSRS settings to “Drop” for this to be
+     * instant-drop. If it isn’t, the click will simply “use” the item; you can
+     * add a config later if you want to support right-click menus instead.
+     *
+     * @return true if a log widget was found and a drop click was issued
+     */
+    private boolean dropOneLogWithShift()
     {
-        Widget inv = client.getWidget(WidgetInfo.INVENTORY);
-        if (inv == null || inv.isHidden()) return;
+        final Widget inv = client.getWidget(WidgetInfo.INVENTORY);
+        if (inv == null || inv.isHidden()) return false;
+
+        final List<Integer> logIds = Arrays.asList(
+                ItemID.LOGS, ItemID.OAK_LOGS, ItemID.WILLOW_LOGS, ItemID.MAPLE_LOGS,
+                ItemID.YEW_LOGS, ItemID.MAGIC_LOGS, ItemID.REDWOOD_LOGS, ItemID.TEAK_LOGS, ItemID.MAHOGANY_LOGS
+        );
 
         for (Widget w : inv.getDynamicChildren())
         {
-            int id = w.getItemId();
-            if (id == ItemID.LOGS || id == ItemID.OAK_LOGS || id == ItemID.WILLOW_LOGS)
-            {
-                clickRect(w.getBounds());
-                sleep(140, 220);
-                return;
-            }
+            if (w == null) continue;
+            final int id = w.getItemId();
+            if (!logIds.contains(id)) continue;
+
+            final Rectangle bounds = w.getBounds();
+            if (bounds == null) continue;
+
+            // Use the new rectangle helper in HumanMouse; hold Shift = true.
+            humanMouse.clickRect(bounds, /*shift=*/true);
+
+            log.debug("[Heist-WC] drop log (id={}) via Shift-click at {}", id, bounds);
+            return true;
         }
-    }
-
-    private void burnOneLogIfPossible()
-    {
-        Widget inv = client.getWidget(WidgetInfo.INVENTORY);
-        if (inv == null || inv.isHidden()) return;
-
-        Widget tinder = findInvItem(inv, ItemID.TINDERBOX);
-        Widget log    = findFirstOf(inv, List.of(ItemID.LOGS, ItemID.OAK_LOGS, ItemID.WILLOW_LOGS));
-        if (tinder != null && log != null)
-        {
-            clickRect(tinder.getBounds());
-            sleep(120, 200);
-            clickRect(log.getBounds());
-            sleep(800, 1200);
-        }
-    }
-
-    private void clickRect(Rectangle rect)
-    {
-        if (rect == null) return;
-
-        final java.awt.Point target = new java.awt.Point(rect.x + rect.width / 2, rect.y + rect.height / 2);
-        final net.runelite.api.Point mp = client.getMouseCanvasPosition();
-        java.awt.Point from = (mp != null) ? new java.awt.Point(mp.getX(), mp.getY()) : target;
-
-        try
-        {
-            // Normal (no overshoot/misclick) rectangle click
-            MousePlanner.MousePlan p = planner.plan(from, target);
-            mouse.moveAlong(p.path(), p.stepDelayMinMs(), p.stepDelayMaxMs(), false);
-            sleepGaussian(REACT_MEAN, REACT_STD);
-            SyntheticTapLogger.log(target.x, target.y);
-            mouse.clickAt(target, HOLD_MIN, HOLD_MAX, false);
-        }
-        catch (InterruptedException ie)
-        {
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private Widget findInvItem(Widget inv, int itemId)
-    {
-        for (Widget w : inv.getDynamicChildren())
-            if (w.getItemId() == itemId) return w;
-        return null;
-    }
-
-    private Widget findFirstOf(Widget inv, List<Integer> ids)
-    {
-        for (Widget w : inv.getDynamicChildren())
-            if (ids.contains(w.getItemId())) return w;
-        return null;
+        return false;
     }
 
     // =========================================================================
-    // WORLD HELPERS (unchanged)
+    // ANIMATION & MOVEMENT HELPERS
     // =========================================================================
-    private GameObject findNearestTree(int objectId)
+
+    /** True if the player is in a non-idle pose (simple movement heuristic). */
+    private static boolean isMoving(Player me)
     {
-        Player me = client.getLocalPlayer();
-        if (me == null) return null;
-
-        Tile[][][] tiles = client.getScene().getTiles();
-        GameObject best = null;
-        int bestDist = Integer.MAX_VALUE;
-
-        for (int z = 0; z < tiles.length; z++)
-        {
-            for (int x = 0; x < tiles[z].length; x++)
-            {
-                for (int y = 0; y < tiles[z][x].length; y++)
-                {
-                    Tile t = tiles[z][x][y];
-                    if (t == null) continue;
-                    for (GameObject go : t.getGameObjects())
-                    {
-                        if (go == null || go.getId() != objectId || go.getConvexHull() == null) continue;
-                        int d = go.getWorldLocation().distanceTo(me.getWorldLocation());
-                        if (d < bestDist) { best = go; bestDist = d; }
-                    }
-                }
-            }
-        }
-        return best;
+        return me.getPoseAnimation() != me.getIdlePoseAnimation();
     }
 
-    private boolean isMoving(Player me) { return me.getPoseAnimation() != me.getIdlePoseAnimation(); }
-
-    private int currentAxeAnim()
+    /** Determine the correct woodcut animation based on equipped axe. */
+    private int currentAxeAnimation()
     {
-        ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);
+        final ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);
         if (eq == null) return -1;
-        Item weapon = eq.getItem(EquipmentInventorySlot.WEAPON.getSlotIdx());
+
+        final Item weapon = eq.getItem(EquipmentInventorySlot.WEAPON.getSlotIdx());
         if (weapon == null) return -1;
+
         switch (weapon.getId())
         {
             case ItemID.BRONZE_AXE:  return AnimationID.WOODCUTTING_BRONZE;
@@ -373,66 +293,8 @@ public class WoodcutterPlugin extends Plugin
             case ItemID.MITHRIL_AXE: return AnimationID.WOODCUTTING_MITHRIL;
             case ItemID.ADAMANT_AXE: return AnimationID.WOODCUTTING_ADAMANT;
             case ItemID.RUNE_AXE:    return AnimationID.WOODCUTTING_RUNE;
+            // Extend here for Dragon/Infernal/3rd Age if you use them.
             default: return -1;
         }
-    }
-
-    // =========================================================================
-    // SMALL UTILS — same behavior as your old impl
-    // =========================================================================
-    private boolean roll(int pct)
-    {
-        if (pct <= 0) return false;
-        if (pct >= 100) return true;
-        return rng.nextInt(100) < pct;
-    }
-
-    private void sleep(int min, int max)
-    {
-        int d = min + (int)(Math.random() * Math.max(1, (max - min + 1)));
-        wakeAt = System.currentTimeMillis() + d;
-        // NOTE: old code slept directly; here we emulate the same “wait until” via wakeAt
-        // because we’re inside the tick loop. This preserves cadence without Thread.sleep() here.
-    }
-
-    private void sleepGaussian(int mean, int std)
-    {
-        // We mimic Thread.sleep(gaussian) by pushing wakeAt forward, then polling next tick.
-        // For closer fidelity, you can replace with a direct Thread.sleep() on a worker thread.
-        double n = mean + std * randomNormal();
-        int d = (int)Math.max(0, Math.round(n));
-        wakeAt = System.currentTimeMillis() + d;
-    }
-
-    private static double randomNormal()
-    {
-        double u = Math.max(1e-9, Math.random());
-        double v = Math.max(1e-9, Math.random());
-        return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-    }
-
-    private java.awt.Point overshootPoint(java.awt.Point tgt)
-    {
-        int dx = (rng.nextBoolean() ? 1 : -1) * (4 + rng.nextInt(8));
-        int dy = (rng.nextBoolean() ? 1 : -1) * (3 + rng.nextInt(6));
-        return new java.awt.Point(tgt.x + dx, tgt.y + dy);
-    }
-
-    private java.awt.Point offsetAround(java.awt.Point src, int min, int max)
-    {
-        int r = min + rng.nextInt(Math.max(1, max - min + 1));
-        double ang = rng.nextDouble() * Math.PI * 2.0;
-        int dx = (int)Math.round(r * Math.cos(ang));
-        int dy = (int)Math.round(r * Math.sin(ang));
-        return new java.awt.Point(src.x + dx, src.y + dy);
-    }
-
-    // =========================================================================
-    // CONFIG PROVIDER
-    // =========================================================================
-    @Provides
-    WoodcutterConfig provideConfig(ConfigManager cm)
-    {
-        return cm.getConfig(WoodcutterConfig.class);
     }
 }

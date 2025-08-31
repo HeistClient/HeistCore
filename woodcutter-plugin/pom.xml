@@ -1,27 +1,17 @@
 <!--
-  FILE: woodcutter-plugin/pom.xml
-  MODULE: HeistCore/woodcutter-plugin
-
-  TITLE: Heist Woodcutter plugin POM
+  ============================================================================
+  FILE: HeistCore/woodcutter-plugin/pom.xml
+  ROLE: Heist Woodcutter RuneLite plugin
   PURPOSE:
-    - Inherit common settings and properties (like runelite.version) from the
-      root parent POM (heist-parent).
-    - Depend on the LOCAL core-lib module using the SAME groupId/artifactId
-      as declared in the sibling module (ht.heist:core-lib).
-    - Shade ONLY core-lib into this plugin jar so it is self-contained at runtime.
-    - Mark RuneLite artifacts as "provided" because the RL host provides them.
-
-  CRITICAL NOTES:
-    - The <parent> block MUST point to ../pom.xml with groupId ht.heist
-      and artifactId heist-parent (exactly).
-    - The core-lib dependency MUST use groupId ht.heist (not ht.heistcore).
-    - Build from the repo root so Maven’s reactor includes core-lib FIRST.
+    • Depends on core-java (mouse) and core-rl (detectors).
+    • RuneLite deps are 'provided'.
+    • Shades core-java and core-rl into the plugin jar (self-contained).
+  ============================================================================
 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 
-    <!-- Inherit groupId/version/properties (runelite.version, repos, etc.) -->
     <parent>
         <groupId>ht.heist</groupId>
         <artifactId>heist-parent</artifactId>
@@ -33,24 +23,21 @@
     <artifactId>woodcutter-plugin</artifactId>
     <packaging>jar</packaging>
     <name>Heist Woodcutter</name>
-    <description>Thin woodcutter plugin that shades core-lib and uses RuneLite APIs.</description>
 
     <dependencies>
-        <!--
-          DEP: core-lib (LOCAL MODULE)
-          We shade this into the plugin JAR so our plugin is self-contained at runtime.
-          IMPORTANT: coordinates MUST match the sibling module exactly (ht.heist:core-lib).
-        -->
+        <!-- Shade these to keep plugin jar self-contained -->
         <dependency>
             <groupId>ht.heist</groupId>
-            <artifactId>core-lib</artifactId>
+            <artifactId>core-java</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ht.heist</groupId>
+            <artifactId>core-rl</artifactId>
             <version>${project.version}</version>
         </dependency>
 
-        <!--
-          DEP: RuneLite client + API
-          These are provided by the host client at runtime. Do NOT shade these.
-        -->
+        <!-- RuneLite (host-provided) -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
@@ -63,22 +50,11 @@
             <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- Optional: lombok (compile-only) -->
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <version>1.18.32</version>
-            <scope>provided</scope>
-        </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <!--
-              PLUGIN: Jar naming
-              Gives a clean finalName like woodcutter-plugin-1.0-SNAPSHOT.jar
-            -->
+            <!-- Clean jar name -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
@@ -88,12 +64,7 @@
                 </configuration>
             </plugin>
 
-            <!--
-              PLUGIN: Shade ONLY core-lib
-              - We keep plugin.properties so RuneLite can discover the plugin
-              - We exclude RuneLite and Lombok from shading
-              - minimizeJar trims unused bits from shaded classes
-            -->
+            <!-- Shade core-java + core-rl, not RuneLite -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -105,17 +76,14 @@
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
                             <minimizeJar>true</minimizeJar>
-
                             <artifactSet>
                                 <excludes>
                                     <exclude>net.runelite:client</exclude>
                                     <exclude>net.runelite:runelite-api</exclude>
-                                    <exclude>org.projectlombok:lombok</exclude>
                                 </excludes>
                             </artifactSet>
-
                             <transformers>
-                                <!-- Preserve plugin.properties inside the jar root -->
+                                <!-- Keep plugin.properties at jar root for RL discovery -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
                                     <resource>plugin.properties</resource>
                                 </transformer>
@@ -126,5 +94,4 @@
             </plugin>
         </plugins>
     </build>
-
 </project>

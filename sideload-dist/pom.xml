@@ -1,90 +1,48 @@
-<!-- ================================================================
-     FILE: sideload-dist/pom.xml
-     MODULE PURPOSE:
-       Copies only plugin JARs to the RuneLite sideload folder.
-       Avoids using project.parent.basedir to prevent interpolation issues.
-     ================================================================ -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
-                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
-
-    <!-- Parent aggregator coordinates -->
-    <parent>
-        <groupId>ht.heistcore</groupId>
-        <artifactId>heistcore</artifactId>
-        <version>1.0-SNAPSHOT</version>
-    </parent>
-
-    <modelVersion>4.0.0</modelVersion>
-    <artifactId>sideload-dist</artifactId>
-    <packaging>pom</packaging>
-
-    <name>HeistCore - Sideload Distributor</name>
-    <description>Stage and copy RuneLite plugin JARs into the user's sideload folder.</description>
-
-    <!-- Shared properties for portability and clarity -->
-    <properties>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-
-        <!-- Where to stage JARs inside this module -->
-        <stage.dir>${project.build.directory}/sideload</stage.dir>
-
-        <!-- RuneLite sideload folder in the current user's home -->
-        <runelite.sideload.dir>${user.home}/.runelite/sideloaded-plugins</runelite.sideload.dir>
-
-        <!-- Paths to sibling module target folders relative to this module -->
-        <!-- Using project.basedir/.. avoids the parent.basedir interpolation issue -->
-        <hud.jar>${project.basedir}/../heist-hud/target/heist-hud-${project.version}.jar</hud.jar>
-        <woodcutter.jar>${project.basedir}/../woodcutter-plugin/target/woodcutter-plugin-${project.version}.jar</woodcutter.jar>
-
-        <!-- Add more plugins here as you create them -->
-        <!-- <future1.jar>${project.basedir}/../future-plugin-1/target/future-plugin-1-${project.version}.jar</future1.jar> -->
-    </properties>
-
-    <build>
-        <plugins>
-            <!-- Ant-run: stage the JARs and copy them into RuneLite's sideload folder -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-antrun-plugin</artifactId>
-                <version>3.1.0</version>
-                <executions>
-                    <execution>
-                        <id>stage-and-copy</id>
-                        <phase>package</phase>
-                        <configuration>
-                            <target>
-                                <!-- Create staging directory -->
-                                <mkdir dir="${stage.dir}"/>
-                                <echo>Staging plugin jars into: ${stage.dir}</echo>
-
-                                <!-- Copy each plugin jar into staging (fail if missing) -->
-                                <copy file="${hud.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
-                                <copy file="${woodcutter.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
-
-                                <!-- Example for future plugins (set failonerror to false while developing)
-                                <copy file="${future1.jar}" todir="${stage.dir}" failonerror="false" overwrite="true"/>
-                                -->
-
-                                <!-- Ensure RuneLite sideload folder exists -->
-                                <mkdir dir="${runelite.sideload.dir}"/>
-                                <echo>Copying staged jars to: ${runelite.sideload.dir}</echo>
-
-                                <!-- Copy all staged jars to RuneLite sideload folder -->
-                                <copy todir="${runelite.sideload.dir}" overwrite="true">
-                                    <fileset dir="${stage.dir}">
-                                        <include name="*.jar"/>
-                                    </fileset>
-                                </copy>
-                            </target>
-                        </configuration>
-                        <goals>
-                            <goal>run</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-        </plugins>
-    </build>
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <parent>
+    <groupId>ht.heist</groupId>
+    <artifactId>heist-parent</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+  <modelVersion>4.0.0</modelVersion>
+  <artifactId>sideload-dist</artifactId>
+  <packaging>pom</packaging>
+  <name>HeistCore - Sideload Distributor</name>
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <stage.dir>${project.build.directory}/sideload</stage.dir>
+    <runelite.sideload.dir>${user.home}/.runelite/sideloaded-plugins</runelite.sideload.dir>
+    <hud.jar>${project.basedir}/../heist-hud/target/heist-hud-${project.version}.jar</hud.jar>
+    <woodcutter.jar>${project.basedir}/../woodcutter-plugin/target/woodcutter-plugin-${project.version}.jar</woodcutter.jar>
+  </properties>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <version>3.1.0</version>
+        <executions>
+          <execution>
+            <id>stage-and-copy</id>
+            <phase>package</phase>
+            <configuration>
+              <target>
+                <mkdir dir="${stage.dir}"/>
+                <copy file="${hud.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
+                <copy file="${woodcutter.jar}" todir="${stage.dir}" failonerror="true" overwrite="true"/>
+                <mkdir dir="${runelite.sideload.dir}"/>
+                <copy todir="${runelite.sideload.dir}" overwrite="true">
+                  <fileset dir="${stage.dir}"><include name="*.jar"/></fileset>
+                </copy>
+              </target>
+            </configuration>
+            <goals><goal>run</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>
