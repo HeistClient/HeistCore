@@ -1,13 +1,6 @@
-// ============================================================================
-// FILE: HeatPoint.java
-// PACKAGE: ht.heist.hud.service
-// -----------------------------------------------------------------------------
-// TITLE
-//   Small immutable value object for a single heatmap tap.
-//   Keep fields private + provide getters (overlay uses getters).
-// ============================================================================
 package ht.heist.hud.service;
 
+/** Lightweight point record for overlays. */
 public final class HeatPoint
 {
     private final int x;
@@ -21,7 +14,7 @@ public final class HeatPoint
         this.ts = ts;
     }
 
-    public int getX() { return x; }
-    public int getY() { return y; }
-    public long getTs() { return ts; }
+    public int x()  { return x; }
+    public int y()  { return y; }
+    public long ts(){ return ts; }
 }

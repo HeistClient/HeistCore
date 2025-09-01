@@ -1,19 +1,24 @@
 // ============================================================================
 // FILE: HeatmapOverlay.java
+// MODULE: heist-hud
 // PACKAGE: ht.heist.hud.overlay
 // -----------------------------------------------------------------------------
 // TITLE
-//   Heatmap overlay — draws persistent + live taps. Supports infrared palette.
+//   Heatmap Overlay — draws LIVE (fading) + PERSISTENT (no fade) points
 //
-// DRAWING MODEL
-//   • Persistent: small semi-opaque base dots
-//   • Live: stronger dots with color by intensity (age-based)
+// HOW IT WORKS
+//   • LIVE: points from this session; fade over cfg.liveDecayMs()
+//   • PERSISTENT: all-time points; no fade (keeps “hot zones” visible)
+//
+// PERFORMANCE
+//   • For thousands of persistent points this is fine. If you reach millions,
+//     consider downsampling or baking a cached density bitmap.
 // ============================================================================
 package ht.heist.hud.overlay;
 
 import ht.heist.hud.HeistHUDConfig;
-import ht.heist.hud.service.HeatPoint;
 import ht.heist.hud.service.HeatmapService;
+import ht.heist.hud.service.HeatmapService.HeatPoint;
 import net.runelite.api.Client;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
@@ -38,74 +43,77 @@ public class HeatmapOverlay extends Overlay
 
         setPosition(OverlayPosition.DYNAMIC);
         setLayer(OverlayLayer.ABOVE_SCENE);
-        setPriority(50);
+        setPriority(Overlay.PRIORITY_LOW);
     }
 
     @Override
     public Dimension render(Graphics2D g)
     {
-        if (!cfg.showHeatmap()) return null;
+        if (!cfg.showHeatmap())
+            return null;
 
-        final int r = Math.max(1, cfg.heatmapDotRadiusPx());
+        final long now = System.currentTimeMillis();
+        final long window = cfg.liveDecayMs();
 
-        // Persistent layer (optional)
-        if (cfg.showPersistentLayer())
+        final List<HeatPoint> live = cfg.showLiveLayer() ? svc.getLive(now - window, now) : List.of();
+        final List<HeatPoint> per  = cfg.showPersistentLayer() ? svc.getPersistent() : List.of();
+
+        // Diagnostic banner
+        g.setFont(g.getFont().deriveFont(Font.BOLD, 11f));
+        g.setColor(new Color(255, 255, 255, 160));
+        String diag = String.format("Heist Heatmap — live=%d persistent=%d palette=%s",
+                live.size(), per.size(), cfg.palette());
+        g.drawString(diag, 12, 24);
+
+        final int r = cfg.heatmapDotRadiusPx();
+        final HeistHUDConfig.Palette pal = cfg.palette();
+
+        // Draw persistent first (background)
+        if (!per.isEmpty())
         {
-            final List<HeatPoint> all = svc.getPersistent();
-            final Color base = new Color(255, 0, 0, 50); // pale red base
-            for (HeatPoint p : all)
-                fillCircle(g, base, p.getX(), p.getY(), r);
+            for (HeatPoint p : per)
+            {
+                // Basic visibility check; skip off-canvas points
+                if (p.x < -1000 || p.x > 4000 || p.y < -1000 || p.y > 4000) continue;
+                g.setColor((pal == HeistHUDConfig.Palette.INFRARED) ? irRamp(0.6f) : redFade(0.6f));
+                g.fillOval(p.x - r, p.y - r, r * 2, r * 2);
+            }
         }
 
-        // Live layer (age → intensity color)
-        final long now = System.currentTimeMillis();
-        final List<HeatPoint> live = svc.getLive(now, cfg.liveDecayMs());
-        for (HeatPoint p : live)
+        // Draw live on top (foreground), with age-based fade
+        if (!live.isEmpty())
         {
-            double t = 1.0 - Math.min(1.0, (now - p.getTs()) / (double) cfg.liveDecayMs());
-            Color c = heatColor(t);
-            fillCircle(g, c, p.getX(), p.getY(), r + 1);
+            for (HeatPoint p : live)
+            {
+                long age = now - p.ts;
+                if (age < 0 || age > window) continue;
+                float fresh = 1f - (float) age / (float) window; // 1 → new
+                g.setColor((pal == HeistHUDConfig.Palette.INFRARED) ? irRamp(fresh) : redFade(fresh));
+                g.fillOval(p.x - r, p.y - r, r * 2, r * 2);
+            }
         }
 
         return null;
     }
 
-    // ---- Helpers ------------------------------------------------------------
-
-    private static void fillCircle(Graphics2D g, Color c, int x, int y, int r)
+    // Mono red fade
+    private static Color redFade(float strength)
     {
-        g.setColor(c);
-        g.fillOval(x - r, y - r, r * 2, r * 2);
+        strength = clamp01(strength);
+        int a = (int)(40 + 215 * strength); // 40..255
+        return new Color(255, 50, 50, a);
     }
 
-    /** Infrared palette if enabled; otherwise alpha-scaled red. */
-    private Color heatColor(double intensity)
+    // IR ramp: blue→green→yellow→orange→red→white
+    private static Color irRamp(float x)
     {
-        if (!cfg.heatmapInfraredPalette())
-        {
-            int a = clamp((int) Math.round(40 + 180 * intensity), 0, 255);
-            return new Color(255, 0, 0, a);
-        }
-
-        double t = Math.max(0, Math.min(1, intensity));
-        Color[] stops = {
-                new Color(  0,   0, 255), // blue
-                new Color(  0, 255, 255), // cyan
-                new Color(  0, 255,   0), // green
-                new Color(255, 255,   0), // yellow
-                new Color(255,   0,   0)  // red
-        };
-        double pos = t * (stops.length - 1);
-        int i = (int) Math.floor(pos);
-        int j = Math.min(stops.length - 1, i + 1);
-        double u = pos - i;
-
-        int r = (int) Math.round(stops[i].getRed()   * (1 - u) + stops[j].getRed()   * u);
-        int g = (int) Math.round(stops[i].getGreen() * (1 - u) + stops[j].getGreen() * u);
-        int b = (int) Math.round(stops[i].getBlue()  * (1 - u) + stops[j].getBlue()  * u);
-        int a = (int) Math.round(60 + 195 * t);
-        return new Color(r, g, b, clamp(a, 0, 255));
+        x = clamp01(x);
+        if (x < 0.20f) { float t = x / 0.20f;       return new Color(0, (int)(64 + 191*t), 255); }
+        if (x < 0.40f) { float t = (x-0.20f)/0.20f; return new Color(0, 255, (int)(255 - 255*t)); }
+        if (x < 0.60f) { float t = (x-0.40f)/0.20f; return new Color((int)(255*t), 255, 0); }
+        if (x < 0.80f) { float t = (x-0.60f)/0.20f; return new Color(255, (int)(255 - 155*t), 0); }
+        float t = (x-0.80f)/0.20f;                  return new Color(255, (int)(100*t), (int)(100*t));
     }
 
-    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+    private static float clamp01(float v) { return Math.max(0f, Math.min(1f, v)); }
 }
