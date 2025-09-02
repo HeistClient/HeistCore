@@ -17,7 +17,7 @@
 //
 // NOTE: PURE JAVA (no RuneLite imports).
 // ============================================================================
-package ht.heist.corejava.api.input;
+package ht.heist.corejava.input;
 
 public final class ActionContext {
     /** If true, we press SHIFT just before mouse press, and release after. */

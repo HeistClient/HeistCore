@@ -4,15 +4,34 @@
 // PACKAGE: ht.heist.plugins.woodcutter
 // -----------------------------------------------------------------------------
 // TITLE
-//   Heist Woodcutter (Thin Controller)
-//
+//   Heist Woodcutter (Thin, HUD-Decoupled)
+// -----------------------------------------------------------------------------
 // WHAT THIS DOES
-//   • Finds a tree (via core-rl TreeDetector + TreeType from your config)
-//   • Delegates the full humanized click to core-rl HumanMouse:
-//       curved path → reaction pause BEFORE press → short hold → (optional Shift)
-//   • Wires HumanMouse tap sink to SyntheticTapLogger (JSONL) for the HUD
-//   • Shift-drops logs by calling humanMouse.clickRect(..., true)
+//   • Finds the nearest tree (core-rl TreeDetector + your config TreeType)
+//   • Delegates the *entire* click pipeline to core-rl HumanMouse
+//       (curved move → reaction BEFORE press → short hold → optional Shift)
+//   • On startup, wires HumanMouse's tap-sink to SyntheticTapLogger so every
+//     tap is written to JSONL; Heist HUD tails that file to draw the heatmap.
+//   • If inventory fills, shift-drops one log per loop using HumanMouse.clickRect.
+// -----------------------------------------------------------------------------
+// WHY THIS VERSION
+//   • Removes direct references to heist-hud (HeatmapService), eliminating the
+//     compile errors you saw: "Cannot resolve symbol HeatmapService" / addLiveTap.
+//   • HUD integration now happens *only* through the JSONL file (clean boundary).
+// -----------------------------------------------------------------------------
+// REQUIREMENTS (already in your repo):
+//   • ht.heist.corerl.input.HumanMouse
+//   • ht.heist.corerl.object.TreeDetector / TreeType
+//   • ht.heist.plugins.woodcutter.io.SyntheticTapLogger (your JSONL writer)
+// -----------------------------------------------------------------------------
+// HUD SETUP REMINDER
+//   In the Heist HUD config:
+//     - Read JSONL taps: ON
+//     - JSONL path: must match your SyntheticTapLogger path
+//     - Show heatmap (and layers): ON
+//     - Palette: as you prefer (Infrared or Red)
 // ============================================================================
+
 package ht.heist.plugins.woodcutter;
 
 import com.google.inject.Provides;
@@ -39,48 +58,50 @@ import java.util.Random;
 
 @PluginDescriptor(
         name = "Heist Woodcutter",
-        description = "Cuts trees with core-rl human mouse and shift-drops logs.",
+        description = "Cuts trees using core-rl HumanMouse; logs taps to JSONL for the HUD.",
         tags = {"heist","woodcutting"}
 )
 public class WoodcutterPlugin extends Plugin
 {
     private static final Logger log = LoggerFactory.getLogger(WoodcutterPlugin.class);
 
-    // RL + core-rl
+    // ---- Injected deps -------------------------------------------------------
     @Inject private Client client;
     @Inject private WoodcutterConfig config;
-    @Inject private HumanMouse humanMouse;
+    @Inject private HumanMouse humanMouse;                    // core-rl: move→react→press on worker
+    @Inject private SyntheticTapLogger syntheticTapLogger;    // JSONL writer (HUD tails this)
 
-    // JSONL writer for HUD
-    @Inject private SyntheticTapLogger syntheticTapLogger;
-
-    // Simple state
+    // ---- State ---------------------------------------------------------------
     private enum State { STARTING, FINDING_TREE, VERIFYING, CHOPPING, INVENTORY }
     private State state = State.STARTING;
-    private long  wakeAt = 0L;
+    private long  wakeAt = 0L;                                // simple tick gate
 
     private GameObject targetTree = null;
     private final Random rng = new Random();
 
+    // ---- Config provider (RuneLite standard) --------------------------------
     @Provides
-    WoodcutterConfig provideConfig(ConfigManager cm) { return cm.getConfig(WoodcutterConfig.class); }
+    WoodcutterConfig provideConfig(ConfigManager cm) {
+        return cm.getConfig(WoodcutterConfig.class);
+    }
 
+    // ---- Lifecycle -----------------------------------------------------------
     @Override
     protected void startUp()
     {
-        // Wire tap sink → JSONL (HUD tails it). Also emit a quick log per tap.
+        // 1) Feed synthetic taps → JSONL (HUD tail will show them on the heatmap)
         humanMouse.setTapSink(p -> {
-            try {
-                log.info("[Woodcutter] tap at {},{}", p.x, p.y);
-                syntheticTapLogger.log(p.x, p.y);
-            } catch (Throwable ignored) {}
+            try { syntheticTapLogger.log(p.x, p.y); } catch (Throwable ignored) {}
         });
 
-        // Optional: if shift feels tight, bump small waits (if your HumanMouse exposes them)
-        // humanMouse.setShiftWaitsMs(30, 30);
+        // 2) (Optional) feel tuning — safe defaults are already in HumanMouse
+        // humanMouse.setStepRange(6, 12);     // path step pacing (ms)
+        // humanMouse.setReaction(120, 40);    // pre-press reaction (gaussian)
+        // humanMouse.setHoldRange(30, 55);    // press/hold (ms)
+        // humanMouse.setShiftWaitsMs(30, 30); // if you need generous Shift windows
 
         state = State.FINDING_TREE;
-        log.info("Heist Woodcutter started.");
+        log.info("Heist Woodcutter started (taps → JSONL; HUD tails file).");
     }
 
     @Override
@@ -90,6 +111,7 @@ public class WoodcutterPlugin extends Plugin
         log.info("Heist Woodcutter stopped.");
     }
 
+    // ---- Tick loop (thin controller) ----------------------------------------
     @Subscribe
     public void onGameTick(GameTick tick)
     {
@@ -108,11 +130,15 @@ public class WoodcutterPlugin extends Plugin
 
                 if (targetTree == null)
                 {
+                    // nothing in view; idle lightly
                     wakeAt = System.currentTimeMillis() + 400 + rng.nextInt(400);
                     break;
                 }
 
-                clickHull(targetTree);
+                // Delegate the entire click to HumanMouse (worker thread):
+                clickGameObjectHull(targetTree);
+
+                // Allow the worker to run a bit, then verify via animation
                 state = State.VERIFYING;
                 wakeAt = System.currentTimeMillis() + 900 + rng.nextInt(300);
                 break;
@@ -120,20 +146,29 @@ public class WoodcutterPlugin extends Plugin
 
             case VERIFYING:
             {
-                if (me.getAnimation() == currentAxeAnim()) {
+                if (me.getAnimation() == currentAxeAnim())
+                {
                     state = State.CHOPPING;
-                } else if (me.getPoseAnimation() == me.getIdlePoseAnimation()) {
-                    state = State.FINDING_TREE;
+                }
+                else
+                {
+                    // not moving and no chop? try again
+                    if (me.getPoseAnimation() == me.getIdlePoseAnimation())
+                        state = State.FINDING_TREE;
                 }
                 break;
             }
 
             case CHOPPING:
             {
-                if (me.getAnimation() != currentAxeAnim()) {
+                if (me.getAnimation() != currentAxeAnim())
+                {
+                    // chop ended/despawned
                     state = State.FINDING_TREE;
                 }
-                if (isInventoryFull()) {
+                // inventory full? go drop
+                if (isInventoryFull())
+                {
                     state = State.INVENTORY;
                 }
                 break;
@@ -141,34 +176,38 @@ public class WoodcutterPlugin extends Plugin
 
             case INVENTORY:
             {
-                if (!dropOneLogIfPresent()) {
-                    state = State.FINDING_TREE; // done dropping → resume
+                // Shift-drop one log per loop; HumanMouse handles Shift timing internally
+                if (!dropOneLogIfPresent())
+                {
+                    // nothing left to drop; resume cutting
+                    state = State.FINDING_TREE;
                 }
+                // brief human pause between drops
                 wakeAt = System.currentTimeMillis() + 180 + rng.nextInt(120);
                 break;
             }
         }
     }
 
-    // ---- thin click helper --------------------------------------------------
-    private void clickHull(GameObject obj)
+    // ---- Thin click helper (delegates to core-rl) ---------------------------
+    private void clickGameObjectHull(GameObject obj)
     {
         if (obj == null) return;
         final Shape hull = obj.getConvexHull();
         if (hull == null) return;
 
-        // HumanMouse worker will: curve move → reaction wait → press/hold/release
         humanMouse.clickHull(hull, /*shift=*/false);
     }
 
-    // ---- inventory helpers --------------------------------------------------
+    // ---- Inventory helpers (Shift-drop) -------------------------------------
     private boolean dropOneLogIfPresent()
     {
         final Widget inv = client.getWidget(WidgetInfo.INVENTORY);
         if (inv == null || inv.isHidden()) return false;
 
         final List<Integer> logIds = Arrays.asList(
-                ItemID.LOGS, ItemID.OAK_LOGS, ItemID.WILLOW_LOGS, ItemID.MAPLE_LOGS
+                ItemID.LOGS, ItemID.OAK_LOGS, ItemID.WILLOW_LOGS, ItemID.MAPLE_LOGS,
+                ItemID.TEAK_LOGS, ItemID.MAHOGANY_LOGS, ItemID.YEW_LOGS, ItemID.MAGIC_LOGS
         );
 
         for (Widget w : inv.getDynamicChildren())
@@ -176,7 +215,7 @@ public class WoodcutterPlugin extends Plugin
             if (w == null) continue;
             if (logIds.contains(w.getItemId()))
             {
-                // Shift-drop via HumanMouse rectangle helper
+                // Shift-drop this slot via HumanMouse (curved → react → press with Shift)
                 humanMouse.clickRect(w.getBounds(), /*shift=*/true);
                 return true;
             }
@@ -190,7 +229,7 @@ public class WoodcutterPlugin extends Plugin
         return inv != null && inv.count() >= 28;
     }
 
-    // ---- axe anim helper ----------------------------------------------------
+    // ---- Axe animation lookup (unchanged) -----------------------------------
     private int currentAxeAnim()
     {
         final ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);

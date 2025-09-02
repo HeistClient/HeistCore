@@ -1,52 +1,68 @@
 // ============================================================================
 // FILE: ClickDotsOverlay.java
+// MODULE: heist-hud
 // PACKAGE: ht.heist.hud.overlay
-// TITLE: ClickDotsOverlay — draw small dots for tailed synthetic taps
+// -----------------------------------------------------------------------------
+// TITLE
+//   ClickDotsOverlay — draws a solid dot for each TapEvent in the store
 //
 // PURPOSE
-// • Lightweight verification that the JSONL bridge works and paths are correct.
-// • We keep a bounded circular buffer of recent points and draw filled ovals.
+//   - Provide immediate visual confirmation of clicks on the canvas.
+//   - Uses the persistent store (no fade). Typically skip UP events.
 //
-// DRAWING
-// • Uses canvas coordinates (already in the JSONL), so no transforms needed.
+// LAYERING
+//   - ABOVE_WIDGETS so dots appear over the inventory UI.
+//
+// PERFORMANCE
+//   - O(n) over the current store each frame. With small dot radius, it’s cheap.
 // ============================================================================
+
 package ht.heist.hud.overlay;
 
+import ht.heist.corejava.api.input.TapEvent;
+import ht.heist.hud.HeistHUDConfig;
+import ht.heist.hud.service.ClickStore;
 import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
 
+import javax.inject.Inject;
 import java.awt.*;
-import java.util.ArrayDeque;
-import java.util.Deque;
+import java.util.List;
 
-public final class ClickDotsOverlay extends Overlay {
+public final class ClickDotsOverlay extends Overlay
+{
+    private final HeistHUDConfig cfg;
+    private final ClickStore store;
 
-    private final Deque<Point> recent = new ArrayDeque<>(4096);
-    private int radiusPx = 2;
-
-    public ClickDotsOverlay() {
+    @Inject
+    public ClickDotsOverlay(HeistHUDConfig cfg, ClickStore store) {
+        this.cfg = cfg;
+        this.store = store;
         setPosition(OverlayPosition.DYNAMIC);
+        setLayer(OverlayLayer.ABOVE_WIDGETS);
         setPriority(PRIORITY_MED);
         setMovable(false);
     }
 
-    /** Called from the tailer callback on client thread. */
-    public void addPoint(int x, int y, int keep, int radiusPx) {
-        this.radiusPx = Math.max(1, radiusPx);
-        if (recent.size() >= keep) recent.pollFirst();
-        recent.addLast(new Point(x, y));
-    }
-
     @Override
-    public Dimension render(Graphics2D g) {
-        final int r = radiusPx;
+    public Dimension render(Graphics2D g)
+    {
+        if (!cfg.showDots()) return null;
+
+        final int r = Math.max(1, cfg.dotRadiusPx());
         final int d = r * 2;
-        final Color old = g.getColor();
-        g.setColor(new Color(255, 200, 0, 180));
-        for (Point p : recent) {
-            g.fillOval(p.x - r, p.y - r, d, d);
+
+        final Color prev = g.getColor();
+        g.setColor(new Color(255, 200, 0, 200)); // warm amber
+
+        final List<TapEvent> events = store.unmodifiableView();
+        for (TapEvent e : events) {
+            if (e.type == TapEvent.Type.UP) continue; // usually not interesting for density
+            g.fillOval(e.xCanvas - r, e.yCanvas - r, d, d);
         }
-        g.setColor(old);
+
+        g.setColor(prev);
         return null;
     }
 }

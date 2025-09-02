@@ -4,142 +4,133 @@
 // PACKAGE: ht.heist.hud.export
 // -----------------------------------------------------------------------------
 // TITLE
-//   Heatmap PNG Exporter — bakes persistent/live points into an image
+//   HeatmapExporter — true density PNG (IR / Red) from TapEvents
 //
-// HOW IT WORKS
-//   • Builds a scalar intensity grid via a simple circular kernel (radius R)
-//   • Finds the max intensity and maps to the selected palette (IR or RED)
-//   • Optionally layers LIVE points as well
+// PURPOSE
+//   - Convert the in-memory ClickStore (TapEvent list) into a density image.
+//   - IR palette gives "hot/cold" for quick distribution analysis.
 //
-// PERFORMANCE
-//   • O(width*height + points*kernel_area). With defaults this is quick.
+// INPUTS
+//   - Full TapEvent list (typically from ClickStore#getAll()).
+//   - Canvas width/height at export time.
+//
+// OUTPUT
+//   - Writes PNG into the chosen output directory.
+//
+// NOTE
+//   - We weight each tap with a Gaussian kernel ~ dotRadiusPx.
 // ============================================================================
+
 package ht.heist.hud.export;
 
+import ht.heist.corejava.api.input.TapEvent;
 import ht.heist.hud.HeistHUDConfig;
-import ht.heist.hud.service.HeatmapService.HeatPoint;
 
 import javax.imageio.ImageIO;
+import javax.inject.Singleton;
 import java.awt.*;
 import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
-import java.nio.file.Path;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.List;
 
+@Singleton
 public final class HeatmapExporter
 {
-    private HeatmapExporter() {}
-
-    public static void exportPng(List<HeatPoint> persistent,
-                                 List<HeatPoint> live,
-                                 int width,
-                                 int height,
-                                 HeistHUDConfig.Palette pal,
-                                 int kernelRadius,
-                                 boolean includeLive,
-                                 Path outPath) throws Exception
+    /** Render to outDir/heatmap-YYYYMMDD-HHmmss.png. Returns absolute path or null on failure. */
+    public String exportTo(File outDir, List<TapEvent> events, HeistHUDConfig.Palette palette,
+                           int dotRadiusPx, int width, int height)
     {
-        // 1) Intensity grid
-        float[][] grid = new float[height][width];
+        if (events == null || events.isEmpty() || width <= 0 || height <= 0) return null;
+        try {
+            if (outDir != null && !outDir.exists()) Files.createDirectories(outDir.toPath());
+            File outFile = new File(outDir, "heatmap-" + new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date()) + ".png");
+            render(events, palette, dotRadiusPx, width, height, outFile);
+            return outFile.getAbsolutePath();
+        } catch (Throwable t) { return null; }
+    }
 
-        // Kernel: simple circular mask with 1/r dropoff
-        final int R = Math.max(1, kernelRadius);
-        final float[] weight = radialWeights(R);
+    private static void render(List<TapEvent> events, HeistHUDConfig.Palette palette, int dotRadiusPx,
+                               int width, int height, File outFile) throws IOException
+    {
+        final int w = width, h = height;
+        final float[] density = new float[w * h];
 
-        // Accumulate persistent first
-        for (HeatPoint p : persistent) stamp(grid, p.x, p.y, width, height, R, weight);
+        final int r = Math.max(1, dotRadiusPx);
+        final int kernelRadius = Math.max(2, (int)Math.round(r * 2.5));
+        final double sigma = Math.max(1.0, r * 0.75);
+        final double invTwoSigma2 = 1.0 / (2.0 * sigma * sigma);
 
-        // Optional live layer
-        if (includeLive && live != null) {
-            for (HeatPoint p : live) stamp(grid, p.x, p.y, width, height, R, weight);
-        }
+        float maxDensity = 0f;
 
-        // 2) Find max intensity
-        float max = 0f;
-        for (int y = 0; y < height; y++)
-            for (int x = 0; x < width; x++)
-                if (grid[y][x] > max) max = grid[y][x];
+        for (TapEvent e : events) {
+            if (e.type == TapEvent.Type.UP) continue; // count DOWN/CLICK, ignore UP
+            int px = clamp(e.xCanvas, 0, w - 1);
+            int py = clamp(e.yCanvas, 0, h - 1);
 
-        // 3) Colorize
-        BufferedImage img = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-        if (max <= 0f) {
-            // nothing to draw; still save an empty image
-            ImageIO.write(img, "png", outPath.toFile());
-            return;
-        }
+            int minX = Math.max(0, px - kernelRadius);
+            int maxX = Math.min(w - 1, px + kernelRadius);
+            int minY = Math.max(0, py - kernelRadius);
+            int maxY = Math.min(h - 1, py + kernelRadius);
 
-        for (int y = 0; y < height; y++)
-        {
-            for (int x = 0; x < width; x++)
-            {
-                float t = grid[y][x] / max; // 0..1
-                if (t <= 0f) continue;
+            for (int y = minY; y <= maxY; y++) {
+                int dy = y - py;
+                for (int x = minX; x <= maxX; x++) {
+                    int dx = x - px;
+                    int d2 = dx*dx + dy*dy;
+                    if (d2 > kernelRadius * kernelRadius) continue;
 
-                Color c = (pal == HeistHUDConfig.Palette.INFRARED) ? irRamp(t) : redRamp(t);
-                img.setRGB(x, y, c.getRGB());
+                    float wgt = (float)Math.exp(-d2 * invTwoSigma2);
+                    int idx = y * w + x;
+                    density[idx] += wgt;
+                    if (density[idx] > maxDensity) maxDensity = density[idx];
+                }
             }
         }
 
-        // 4) Ensure directory and save
-        Files.createDirectories(outPath.getParent());
-        ImageIO.write(img, "png", outPath.toFile());
-    }
-
-    // --- helpers -------------------------------------------------------------
-
-    private static void stamp(float[][] grid, int cx, int cy, int w, int h, int R, float[] weight)
-    {
-        if (cx < -R || cy < -R || cx >= w+R || cy >= h+R) return;
-
-        for (int dy = -R; dy <= R; dy++)
-        {
-            int yy = cy + dy;
-            if (yy < 0 || yy >= h) continue;
-
-            for (int dx = -R; dx <= R; dx++)
-            {
-                int xx = cx + dx;
-                if (xx < 0 || xx >= w) continue;
-
-                int rr = dx*dx + dy*dy;
-                if (rr > R*R) continue;
-
-                int ri = (int)Math.round(Math.sqrt(rr));
-                grid[yy][xx] += weight[ri];
+        final BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        final int[] argb = new int[w * h];
+        if (maxDensity > 0f) {
+            for (int i = 0; i < argb.length; i++) {
+                double t = clamp01(density[i] / maxDensity);
+                argb[i] = colorFor(t, palette);
             }
         }
+        img.setRGB(0, 0, w, h, argb, 0, w);
+        ImageIO.write(img, "png", outFile);
     }
 
-    private static float[] radialWeights(int R)
+    private static int colorFor(double t, HeistHUDConfig.Palette palette)
     {
-        float[] w = new float[R+1];
-        for (int r = 0; r <= R; r++)
-        {
-            // 1/(1+r) gives strong center with soft falloff
-            w[r] = 1.0f / (1.0f + r);
+        t = clamp01(t);
+        if (palette == HeistHUDConfig.Palette.RED) {
+            int a = (int)Math.round(255 * t);
+            return (a << 24) | (255 << 16); // ARGB for solid red with alpha = t
         }
-        return w;
+        final Color[] ramp = new Color[] {
+                new Color(  0,   0,  64),
+                new Color(  0, 128, 255),
+                new Color(  0, 200,   0),
+                new Color(255, 200,   0),
+                new Color(255,  64,   0),
+                new Color(255, 255, 255)
+        };
+        double seg = t * (ramp.length - 1);
+        int i = (int)Math.floor(seg);
+        if (i >= ramp.length - 1) i = ramp.length - 2;
+        double f = seg - i;
+
+        Color c0 = ramp[i], c1 = ramp[i + 1];
+        int r = (int)Math.round(c0.getRed()   + f * (c1.getRed()   - c0.getRed()));
+        int g = (int)Math.round(c0.getGreen() + f * (c1.getGreen() - c0.getGreen()));
+        int b = (int)Math.round(c0.getBlue()  + f * (c1.getBlue()  - c0.getBlue()));
+        int a = (int)Math.round(64 + 191 * t); // 64..255
+        return (a << 24) | (r << 16) | (g << 8) | b;
     }
 
-    // Color ramps for export (opaque; no alpha blending)
-    private static Color redRamp(float x)
-    {
-        x = clamp01(x);
-        int r = 255;
-        int g = (int)(50 + 205*x);
-        int b = (int)(50 + 205*x);
-        return new Color(r, 255 - g, 255 - b); // red→white as intensity grows
-    }
-
-    private static Color irRamp(float x)
-    {
-        x = clamp01(x);
-        if (x < 0.20f) { float t = x / 0.20f;       return new Color(0, (int)(64 + 191*t), 255); }
-        if (x < 0.40f) { float t = (x-0.20f)/0.20f; return new Color(0, 255, (int)(255 - 255*t)); }
-        if (x < 0.60f) { float t = (x-0.40f)/0.20f; return new Color((int)(255*t), 255, 0); }
-        if (x < 0.80f) { float t = (x-0.60f)/0.20f; return new Color(255, (int)(255 - 155*t), 0); }
-        float t = (x-0.80f)/0.20f;                  return new Color(255, (int)(100*t), (int)(100*t));
-    }
-
-    private static float clamp01(float v) { return Math.max(0f, Math.min(1f, v)); }
+    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+    private static double clamp01(double x) { return x <= 0 ? 0 : Math.min(1, x); }
 }

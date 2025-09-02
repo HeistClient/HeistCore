@@ -45,6 +45,17 @@
             <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
+        <dependency>
+            <groupId>javax.inject</groupId>
+            <artifactId>javax.inject</artifactId>
+            <version>1</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>ht.heist</groupId>
+            <artifactId>core-java</artifactId>
+            <version>${project.version}</version>
+        </dependency>
     </dependencies>
 
     <build>
