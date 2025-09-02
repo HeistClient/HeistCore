@@ -4,23 +4,22 @@
 // PACKAGE: ht.heist.hud
 // -----------------------------------------------------------------------------
 // TITLE
-//   HeistHUDPlugin — overlays + panel + Phase-A instrumentation.
+//   HeistHUDPlugin — overlays + panel + Phase-A instrumentation
+//   (with robust "processed" detection: match-window + post-UP grace).
 //
-// WHAT THIS PLUGIN DOES
-//   • Adds overlays (dots + cursor tracer) and the Heist HUD sidebar panel.
-//   • Subscribes to TapBus indirectly via ClickLogger (for TapEvent JSONL).
-//   • Captures MANUAL taps from RuneLite AWT events, converts to TapEvent,
-//     and now (Phase A) also:
-//        - Generates a stable eventId per gesture (DOWN ↔ UP)
-//        - Estimates dwell_before_press (manual) without high-rate logging
-//        - Computes hold_ms at UP
-//        - Detects whether the tap was processed via MenuOptionClicked
-//        - Emits 'move_features' + 'tap_result' JSONL lines via ClickLogger
+// WHAT THIS VERSION ADDS
+//   • "Match window": we accept a MenuOptionClicked up to 450 ms after DOWN.
+//   • "Grace timer": instead of writing processed:false immediately at UP,
+//     we schedule it ~180 ms later; if a real MenuOptionClicked arrives in
+//     the meantime, we cancel the false write and emit processed:true.
 //
-// DESIGN NOTES
-//   • No behavior change for overlays/export; this is pure instrumentation.
-//   • All new logging is append-only JSONL and keyed by 'event_id'.
-//   • JDK 11 compatible (no switch expressions).
+// WHY THIS MATTERS
+//   This eliminates rare "false negatives" when the client reports acceptance
+//   slightly after your UP due to normal latency.
+//
+// COMPATIBILITY
+//   • JDK 11 safe (no switch expressions).
+//   • No behavior change to overlays/export; this only affects logging.
 // ============================================================================
 
 package ht.heist.hud;
@@ -60,6 +59,10 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 @PluginDescriptor(
         name = "Heist HUD",
@@ -82,8 +85,8 @@ public final class HeistHUDPlugin extends Plugin
     // ---- UI handle ----------------------------------------------------------
     private NavigationButton navButton;
 
-    // ---- Listeners (created in startUp, not at field init) ------------------
-    private TapBus.Listener busListener;      // (kept for completeness; ClickLogger registers its own listener)
+    // ---- Listeners (created in startUp) ------------------------------------
+    private TapBus.Listener busListener;
     private MouseAdapter rlMouseAdapter;
 
     // ---- On-disk logging ----------------------------------------------------
@@ -91,27 +94,30 @@ public final class HeistHUDPlugin extends Plugin
     private String sessionId;
 
     // ---- Phase-A: gesture correlation & dwell tracking ----------------------
-    private static final int SIG_MOVE_RADIUS_PX = 2;     // "significant move" radius
+    private static final int  SIG_MOVE_RADIUS_PX   = 2;    // "significant move" radius
+    private static final long MATCH_WINDOW_MS      = 450;  // accept MenuOptionClicked this long after DOWN
+    private static final long FALSE_GRACE_MS       = 180;  // delay before writing processed:false
     private volatile long lastMoveTs = 0L;
     private volatile int  lastMoveX  = Integer.MIN_VALUE;
     private volatile int  lastMoveY  = Integer.MIN_VALUE;
 
-    private static final long PROCESSED_WINDOW_MS = 200L; // time window to match menu click after DOWN
-
     /** Pending DOWN info per mouse button, so UP can correlate and finalize. */
     private final Map<Integer, Pending> pendingByButton = new HashMap<>();
 
-    /** Small holder for correlating DOWN↔UP and tap_result. */
+    /** Single-thread scheduler for the post-UP grace (daemon). */
+    private ScheduledExecutorService scheduler;
+
+    /** Small holder for correlating DOWN↔UP and tap_result (with grace future). */
     private static final class Pending {
         final String eventId;
         final long   downTs;
         final int    downX, downY;
         final Integer dwellMs;         // estimated at DOWN (manual)
-        // Simple menu snapshot (best-effort; helps tap_result matching / audits)
-        final String  opt;
+        final String  opt;             // snapshot of default menu at DOWN (best-effort)
         final String  tgt;
         final Integer opcode;
-        volatile boolean processed;    // set true when we observe MenuOptionClicked
+        volatile boolean processed;    // true once we saw a matching MenuOptionClicked
+        volatile ScheduledFuture<?> graceFuture; // "write false" task scheduled at UP
         Pending(String eventId, long downTs, int downX, int downY,
                 Integer dwellMs, String opt, String tgt, Integer opcode)
         {
@@ -124,6 +130,7 @@ public final class HeistHUDPlugin extends Plugin
             this.tgt       = tgt;
             this.opcode    = opcode;
             this.processed = false;
+            this.graceFuture = null;
         }
     }
 
@@ -134,11 +141,11 @@ public final class HeistHUDPlugin extends Plugin
     @Override
     protected void startUp()
     {
-        // 1) Overlays are always added; they check their own config toggles.
+        // Overlays always added; they check their own config toggles.
         overlayManager.add(dotsOverlay);
         overlayManager.add(cursorTracerOverlay);
 
-        // 2) Sidebar panel (NavigationButton with icon so it always renders)
+        // Sidebar panel (NavigationButton with icon so it always renders).
         final BufferedImage icon = ImageUtil.loadImageResource(HeistHUDPlugin.class, "/heist_hud_icon.png");
         navButton = NavigationButton.builder()
                 .tooltip("Heist HUD")
@@ -148,59 +155,74 @@ public final class HeistHUDPlugin extends Plugin
                 .build();
         clientToolbar.addNavigation(navButton);
 
-        // 3) (Optional) Keep a TapBus ref here for completeness; ClickLogger registers itself.
-        busListener = store::add; // still feeds on-screen dots
+        // Dots store listener (for on-screen points) — logger also subscribes.
+        busListener = store::add;
         TapBus.addListener(busListener);
 
-        // 4) Capture manual clicks via RuneLite mouse manager (PRESS/RELEASE/CLICK + MOVED)
+        // Capture manual clicks via RuneLite mouse manager (MOVE/PRESS/RELEASE/CLICK).
         rlMouseAdapter = new MouseAdapter() {
             @Override public MouseEvent mouseMoved(MouseEvent e)   { onMouseMoved(e);   return e; }
             @Override public MouseEvent mousePressed(MouseEvent e) { onMousePressed(e); return e; }
             @Override public MouseEvent mouseReleased(MouseEvent e){ onMouseReleased(e);return e; }
-            @Override public MouseEvent mouseClicked(MouseEvent e) { postFromAwt(e, Type.CLICK, /*eventId*/ null, /*menu snapshot*/ null, null, null); return e; }
+            @Override public MouseEvent mouseClicked(MouseEvent e) { postFromAwt(e, Type.CLICK, /*eventId*/ null, null, null, null); return e; }
         };
         mouseManager.registerMouseListener(rlMouseAdapter);
 
-        // 5) Start JSONL/CSV logging in the output folder
+        // Start JSONL/CSV logging in the output folder.
         sessionId = new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date());
         File outDir = expandOutputDir(cfg.outputDir());
         logger = new ClickLogger(sessionId, outDir, cfg.writeCsv());
         try { logger.start(); } catch (Exception ignored) {}
+
+        // Start grace scheduler (daemon thread).
+        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "HeistHUD-ResultGrace");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     @Override
     protected void shutDown()
     {
-        // Remove overlays
+        // Remove overlays & sidebar tab.
         overlayManager.remove(dotsOverlay);
         overlayManager.remove(cursorTracerOverlay);
-
-        // Remove sidebar tab
         if (navButton != null) {
             clientToolbar.removeNavigation(navButton);
             navButton = null;
         }
 
-        // Unsubscribe TapBus listener (dots store)
+        // Unsubscribe TapBus listener (dots store).
         if (busListener != null) {
             TapBus.removeListener(busListener);
             busListener = null;
         }
 
-        // Unregister mouse listener
+        // Unregister mouse listener.
         if (rlMouseAdapter != null) {
             mouseManager.unregisterMouseListener(rlMouseAdapter);
             rlMouseAdapter = null;
         }
 
-        // Stop logger
+        // Cancel any pending grace tasks and stop scheduler.
+        for (Pending p : pendingByButton.values()) {
+            ScheduledFuture<?> f = p.graceFuture;
+            if (f != null) { f.cancel(true); }
+        }
+        pendingByButton.clear();
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+            scheduler = null;
+        }
+
+        // Stop logger.
         if (logger != null) {
             try { logger.stop(); } catch (Exception ignored) {}
             logger = null;
         }
 
-        // Clear state
-        pendingByButton.clear();
+        // Clear on-screen store.
         store.clear();
     }
 
@@ -228,47 +250,45 @@ public final class HeistHUDPlugin extends Plugin
         final long now = System.currentTimeMillis();
         final String eventId = UUID.randomUUID().toString();
 
-        // Estimate dwell: time since last "significant" move
+        // Estimate dwell: time since last "significant" move.
         Integer dwellMs = null;
         if (lastMoveTs > 0) {
             long d = now - lastMoveTs;
-            if (d >= 0 && d <= 30_000) dwellMs = (int) d; // guard against absurd values
+            if (d >= 0 && d <= 30_000) dwellMs = (int) d;
         }
 
-        // Snapshot the current default menu entry (best-effort match for processed)
+        // Snapshot the current default menu entry (best-effort for matching).
         String opt = null, tgt = null; Integer opcode = null;
         final MenuEntry[] entries = client.getMenuEntries();
         if (entries != null && entries.length > 0) {
-            final MenuEntry top = entries[entries.length - 1]; // last is left-click default in many RL builds
+            final MenuEntry top = entries[entries.length - 1]; // many RL builds: last = left-click default
             opt = top.getOption();
             tgt = top.getTarget();
-            try { opcode = top.getType().getId(); } catch (Throwable ignore) { /* rl version variance */ }
+            try { opcode = top.getType().getId(); } catch (Throwable ignore) {}
         }
 
-        // Keep pending so UP can finalize hold/features/result
+        // Keep pending so UP can finalize hold/features/result (with grace).
         pendingByButton.put(e.getButton(), new Pending(eventId, now, e.getX(), e.getY(), dwellMs, opt, tgt, opcode));
 
-        // Post TapEvent DOWN with eventId + simple context snapshot
+        // Post TapEvent DOWN with eventId + simple context snapshot.
         postFromAwt(e, Type.DOWN, eventId, opt, tgt, opcode);
     }
 
     // ------------------------------------------------------------------------
-    // RELEASE → compute hold, emit move_features, emit tap_result if not set
+    // RELEASE → compute hold, emit move_features, schedule processed:false
     // ------------------------------------------------------------------------
     private void onMouseReleased(MouseEvent e)
     {
         final long now = System.currentTimeMillis();
-        final Pending p = pendingByButton.remove(e.getButton());
+        final Pending p = pendingByButton.get(e.getButton()); // keep until grace completes
         final String eventId = (p != null ? p.eventId : null);
 
-        // Always post TapEvent UP (correlated by eventId if available)
+        // Always post TapEvent UP (correlated by eventId if available).
         postFromAwt(e, Type.UP, eventId, /*opt*/ null, /*tgt*/ null, /*opcode*/ null);
 
-        // If we have a pending DOWN, we can emit features + (possibly) result
+        // Emit move_features if we have a pending DOWN.
         if (p != null && logger != null) {
             final Integer holdMs = (int)Math.max(0, now - p.downTs);
-
-            // Emit move_features for this manual gesture
             final MoveFeatures mf = new MoveFeatures(
                     sessionId, p.eventId, "manual",
                     p.dwellMs, /*reactionJitterMs*/ null, holdMs,
@@ -278,22 +298,26 @@ public final class HeistHUDPlugin extends Plugin
             );
             try { logger.writeMoveFeatures(mf); } catch (Exception ignored) {}
 
-            // If no MenuOptionClicked matched within the window, record processed=false
-            if (!p.processed) {
-                final TapResult tr = new TapResult(sessionId, p.eventId, /*processed*/ false, now, p.opt, p.tgt, p.opcode);
-                try { logger.writeTapResult(tr); } catch (Exception ignored) {}
+            // Schedule a "processed:false" write after a short grace.
+            if (scheduler != null) {
+                p.graceFuture = scheduler.schedule(() -> {
+                    if (!p.processed && logger != null) {
+                        final TapResult tr = new TapResult(sessionId, p.eventId, false, System.currentTimeMillis(), p.opt, p.tgt, p.opcode);
+                        try { logger.writeTapResult(tr); } catch (Exception ignored) {}
+                    }
+                    // Clean up this pending if it still belongs to this button key.
+                    pendingByButton.remove(e.getButton(), p);
+                }, FALSE_GRACE_MS, TimeUnit.MILLISECONDS);
             }
         }
     }
 
     // ------------------------------------------------------------------------
-    // RL event: MenuOptionClicked — mark the most recent pending as processed
+    // RL event: MenuOptionClicked — mark processed and cancel false write
     // ------------------------------------------------------------------------
     @Subscribe
     public void onMenuOptionClicked(MenuOptionClicked ev)
     {
-        // Find a "recent" pending DOWN whose menu snapshot matches best-effort.
-        // NOTE: RL params vary by version; we match only option/target/opcode + time window.
         if (pendingByButton.isEmpty()) return;
 
         final long now = System.currentTimeMillis();
@@ -302,18 +326,27 @@ public final class HeistHUDPlugin extends Plugin
         Integer opcode = null;
         try { opcode = ev.getMenuAction().getId(); } catch (Throwable ignore) {}
 
-        for (Pending p : pendingByButton.values()) {
-            if (now - p.downTs > PROCESSED_WINDOW_MS) continue; // too old
+        for (Map.Entry<Integer, Pending> entry : pendingByButton.entrySet()) {
+            final Pending p = entry.getValue();
+            // respect the match window relative to DOWN
+            if (now - p.downTs > MATCH_WINDOW_MS) continue;
+
             boolean optEq = safeEq(p.opt, opt);
             boolean tgtEq = safeEq(p.tgt, tgt);
             boolean opcEq = (p.opcode == null || opcode == null) ? true : p.opcode.equals(opcode);
             if (optEq && tgtEq && opcEq) {
+                // Mark processed, cancel pending false, write true result.
                 p.processed = true;
-                // Emit tap_result=true for this gesture
+                final ScheduledFuture<?> f = p.graceFuture;
+                if (f != null) { f.cancel(true); }
+
                 if (logger != null) {
                     final TapResult tr = new TapResult(sessionId, p.eventId, true, now, p.opt, p.tgt, p.opcode);
                     try { logger.writeTapResult(tr); } catch (Exception ignored) {}
                 }
+
+                // We keep the Pending until the grace task or UP cleanup removes it,
+                // to avoid races if UP hasn't scheduled yet.
                 break;
             }
         }
@@ -353,7 +386,7 @@ public final class HeistHUDPlugin extends Plugin
                 /*widgetId*/ null,
                 /*menuOption*/ opt, /*menuTarget*/ tgt,
                 /*opcode*/ opcode,
-                /*processed*/ null // we'll emit a separate tap_result later
+                /*processed*/ null // result is emitted as a separate tap_result record
         );
         TapBus.post(ev);
     }
