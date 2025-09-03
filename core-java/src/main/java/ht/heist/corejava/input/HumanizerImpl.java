@@ -1,32 +1,28 @@
 // ============================================================================
 // FILE: HumanizerImpl.java
-// MODULE: core-java (PURE Java; NO RuneLite)
+// PATH: core-java/src/main/java/ht/heist/corejava/input/HumanizerImpl.java
 // PACKAGE: ht.heist.corejava.input
 // -----------------------------------------------------------------------------
 // TITLE
-//   HumanizerImpl — default "human feel" implementation (stateful).
+//   HumanizerImpl — Default "feel" implementation with jitter + drift + fatigue
 //
-// WHAT THIS IMPLEMENTATION PROVIDES (defaults picked to match your current feel)
-//   • Dwell BEFORE press:              240..360 ms
-//   • Reaction jitter (pre-press):     mean 150 ms, std 45 ms
-//   • Hold (press down) duration:      42..65 ms
-//   • Path curvature:                  0.55 (moderate arc)
-//   • Path wobble amplitude:           1.6 px (tiny micro-noise)
-//   • Step pacing per move:            6..12 ms (smoothness)
-//   • Sticky AR(1) drift for shape bias: alpha 0.86, noise 0.90, clamp ±3.0 px
+// WHAT THIS CLASS PROVIDES
+//   • All timings (dwell/reaction/hold, key lead/lag) with Gaussian-ish sampling.
+//   • Path parameters (curvature with jitter, micro-wobble, step pacing).
+//   • Sticky AR(1) drift for slight bias that evolves across actions.
+//   • Overshoot/correction knobs (probability, magnitude, pause).
+//   • Approach ease-in (slows near target).
+//   • Fatigue multiplier and session lifecycle hook.
 //
 // WHY STATEFUL?
-//   • The drift has a small internal state (driftX/driftY) that evolves across
-//     calls (gives that "sticky-but-human" sampling sensation).
-//
-// CUSTOMIZATION
-//   • Use the no-arg constructor for sensible defaults.
-//   • Or use the full constructor to plug your own numbers (or learned profile).
+//   Drift is stateful to create "sticky" shape bias. Fatigue can be adjusted over
+//   time by a higher-level controller (e.g., IdleController).
 //
 // THREADING
-//   • Extremely light state; if you call from multiple threads, you may want to
-//     synchronize reads of drift. In practice, this is used from a single input
-//     thread, so we keep it simple.
+//   Extremely light state; commonly used on a single input thread.
+//
+// NOTE
+//   Defaults match your previous feel, with mild improvements for variety.
 // ============================================================================
 
 package ht.heist.corejava.input;
@@ -47,83 +43,131 @@ public final class HumanizerImpl implements Humanizer
     private final int holdMinMs;
     private final int holdMaxMs;
 
+    // Key waits (lead/lag) around Shift — sampled per call
+    private final int keyMinMs;
+    private final int keyMeanMs;
+    private final int keyStdMs;
+
     // ---- Path & pacing knobs ------------------------------------------------
-    private final double pathCurvature;
+    private final double pathCurvMean;    // mean curvature
+    private final double pathCurvStd;     // std for curvature jitter
     private final double pathWobblePx;
 
     private final int stepMinMs;
     private final int stepMaxMs;
+
+    private final double approachEaseIn;  // 0..1 slowdown near the end
 
     // ---- Sticky drift (AR(1)) ----------------------------------------------
     private final double driftAlpha;      // e.g., 0.86
     private final double driftNoiseStd;   // e.g., 0.90
     private final double driftClampAbs;   // e.g., 3.0 (px)
 
-    private double driftX = 0.0;          // mutable, tiny bias state
+    private double driftX = 0.0;          // mutable tiny bias state
     private double driftY = 0.0;
+
+    // ---- Overshoot/correction knobs ----------------------------------------
+    private final double overshootProb;
+    private final double overshootMaxPx;
+    private final int    correctionPauseMeanMs;
+    private final int    correctionPauseStdMs;
+
+    // ---- Fatigue ------------------------------------------------------------
+    private volatile double fatigue01 = 0.0; // 0 = fresh, 1 = fatigued
 
     // ---- Constructors -------------------------------------------------------
 
-    /** Default: matches your current MouseServiceImpl feel. */
+    /** Default profile: safe, human-ish settings aligned with prior feel. */
     public HumanizerImpl() {
         this(
-                // timing
-                240, 360,            // dwell min/max
-                150, 45,             // reaction mean/std
-                42, 65,              // hold min/max
+                // timing (dwell, reaction, hold)
+                240, 360,     // dwell min/max
+                150, 45,      // reaction mean/std
+                42,  65,      // hold min/max
+                // key waits
+                25, 30, 8,    // key min/mean/std (lead & lag symmetric)
                 // path & pacing
-                0.55, 1.6,           // curvature, wobble(px)
-                6, 12,               // step min/max (ms)
+                0.55, 0.12,   // curvature mean/std (NEW: jitter per path)
+                1.6,          // micro wobble px
+                6, 12,        // step min/max ms
+                0.35,         // approach ease-in [0..1]
                 // drift
-                0.86, 0.90, 3.0      // alpha, noiseStd, clampAbs(px)
+                0.86, 0.90, 3.0, // alpha, noise, clampAbs
+                // overshoot
+                0.10, 12.0,   // prob, max overshoot px
+                70,  25       // correction pause mean/std ms
         );
     }
 
-    /** Full-control constructor for custom profiles. */
+    /** Full-control constructor for custom/learned profiles. */
     public HumanizerImpl(
             int dwellMinMs, int dwellMaxMs,
             int reactionMeanMs, int reactionStdMs,
             int holdMinMs, int holdMaxMs,
-            double pathCurvature, double pathWobblePx,
+            int keyMinMs, int keyMeanMs, int keyStdMs,
+            double pathCurvMean, double pathCurvStd,
+            double pathWobblePx,
             int stepMinMs, int stepMaxMs,
-            double driftAlpha, double driftNoiseStd, double driftClampAbs)
+            double approachEaseIn,
+            double driftAlpha, double driftNoiseStd, double driftClampAbs,
+            double overshootProb, double overshootMaxPx,
+            int correctionPauseMeanMs, int correctionPauseStdMs)
     {
-        this.dwellMinMs = dwellMinMs;
-        this.dwellMaxMs = Math.max(dwellMinMs, dwellMaxMs);
-
+        this.dwellMinMs     = dwellMinMs;
+        this.dwellMaxMs     = Math.max(dwellMinMs, dwellMaxMs);
         this.reactionMeanMs = reactionMeanMs;
         this.reactionStdMs  = Math.max(0, reactionStdMs);
+        this.holdMinMs      = holdMinMs;
+        this.holdMaxMs      = Math.max(holdMinMs, holdMaxMs);
 
-        this.holdMinMs = holdMinMs;
-        this.holdMaxMs = Math.max(holdMinMs, holdMaxMs);
+        this.keyMinMs  = Math.max(0, keyMinMs);
+        this.keyMeanMs = Math.max(0, keyMeanMs);
+        this.keyStdMs  = Math.max(0, keyStdMs);
 
-        this.pathCurvature = Math.max(0.0, pathCurvature);
-        this.pathWobblePx  = Math.max(0.0, pathWobblePx);
-
-        this.stepMinMs = stepMinMs;
-        this.stepMaxMs = Math.max(stepMinMs, stepMaxMs);
+        this.pathCurvMean   = Math.max(0.0, pathCurvMean);
+        this.pathCurvStd    = Math.max(0.0, pathCurvStd);
+        this.pathWobblePx   = Math.max(0.0, pathWobblePx);
+        this.stepMinMs      = Math.max(1, stepMinMs);
+        this.stepMaxMs      = Math.max(this.stepMinMs, stepMaxMs);
+        this.approachEaseIn = clamp(approachEaseIn, 0.0, 1.0);
 
         this.driftAlpha    = clamp(driftAlpha, 0.0, 0.9999);
         this.driftNoiseStd = Math.max(0.0, driftNoiseStd);
         this.driftClampAbs = Math.max(0.1, driftClampAbs);
+
+        this.overshootProb        = clamp(overshootProb, 0.0, 1.0);
+        this.overshootMaxPx       = Math.max(0.0, overshootMaxPx);
+        this.correctionPauseMeanMs= Math.max(0, correctionPauseMeanMs);
+        this.correctionPauseStdMs = Math.max(0, correctionPauseStdMs);
     }
 
-    // ---- Humanizer API (getters/steppers) ----------------------------------
+    // ---- Humanizer API: timings --------------------------------------------
 
-    @Override public int dwellMinMs()      { return dwellMinMs; }
-    @Override public int dwellMaxMs()      { return dwellMaxMs; }
+    @Override public int dwellMinMs()     { return dwellMinMs; }
+    @Override public int dwellMaxMs()     { return dwellMaxMs; }
 
-    @Override public int reactionMeanMs()  { return reactionMeanMs; }
-    @Override public int reactionStdMs()   { return reactionStdMs; }
+    @Override public int reactionMeanMs() { return reactionMeanMs; }
+    @Override public int reactionStdMs()  { return reactionStdMs; }
 
-    @Override public int holdMinMs()       { return holdMinMs; }
-    @Override public int holdMaxMs()       { return holdMaxMs; }
+    @Override public int holdMinMs()      { return holdMinMs; }
+    @Override public int holdMaxMs()      { return holdMaxMs; }
 
-    @Override public double pathCurvature(){ return pathCurvature; }
-    @Override public double pathWobblePx() { return pathWobblePx; }
+    @Override public int keyLeadMs()      { return sampleKeyMs(); }
+    @Override public int keyLagMs()       { return sampleKeyMs(); }
 
-    @Override public int stepMinMs()       { return stepMinMs; }
-    @Override public int stepMaxMs()       { return stepMaxMs; }
+    // ---- Humanizer API: path & pacing --------------------------------------
+
+    @Override public double pathCurvatureMean() { return pathCurvMean; }
+    @Override public double pathCurvatureStd()  { return pathCurvStd;  }
+
+    @Override public double pathCurvature()     { return pathCurvMean; }
+
+    @Override public double pathWobblePx()      { return pathWobblePx; }
+
+    @Override public int stepMinMs()            { return stepMinMs; }
+    @Override public int stepMaxMs()            { return stepMaxMs; }
+
+    @Override public double approachEaseIn()    { return approachEaseIn; }
 
     @Override
     public double[] stepBiasDrift() {
@@ -137,10 +181,45 @@ public final class HumanizerImpl implements Humanizer
         return new double[] { bx, by };
     }
 
+    @Override
+    public double samplePathCurvature() {
+        // sample curvature per path: N(mean, std), clamped to >= 0
+        double v = pathCurvMean + gauss() * pathCurvStd;
+        return Math.max(0.0, v);
+    }
+
+    // ---- Humanizer API: overshoot/correction --------------------------------
+
+    @Override public double overshootProb()         { return overshootProb; }
+    @Override public double overshootMaxPx()        { return overshootMaxPx; }
+    @Override public int    correctionPauseMeanMs() { return correctionPauseMeanMs; }
+    @Override public int    correctionPauseStdMs()  { return correctionPauseStdMs;  }
+
+    // ---- Humanizer API: fatigue & session -----------------------------------
+
+    @Override public double fatigueLevel()          { return fatigue01; }
+    @Override public void   setFatigueLevel(double f) { fatigue01 = clamp(f, 0.0, 1.0); }
+
+    @Override
+    public void onSessionStart() {
+        // Reset drift so each session starts "fresh".
+        driftX = 0.0;
+        driftY = 0.0;
+        // Optionally reset fatigue too:
+        fatigue01 = 0.0;
+    }
+
     // ---- Helpers ------------------------------------------------------------
 
+    /** Sample a (positive) "key wait" ms value with a minimum floor. */
+    private int sampleKeyMs() {
+        double g = Math.abs(gauss());
+        int v = (int)Math.round(keyMeanMs + g * keyStdMs);
+        return Math.max(keyMinMs, v);
+    }
+
+    /** Standard normal using Box–Muller. */
     private static double gauss() {
-        // Box–Muller with safety clamps
         double u = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
         double v = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
         return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2 * Math.PI * v);

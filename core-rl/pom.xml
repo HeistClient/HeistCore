@@ -48,6 +48,12 @@
             <version>1</version>
             <scope>provided</scope>
         </dependency>
+        <!-- SLF4J API (compile only); RL provides the runtime binding -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.13</version>
+        </dependency>
     </dependencies>
 
     <build>

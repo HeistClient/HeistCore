@@ -1,28 +1,18 @@
 // ============================================================================
 // FILE: HumanMouse.java
+// PATH: core-rl/src/main/java/ht/heist/corerl/input/HumanMouse.java
 // PACKAGE: ht.heist.corerl.input
 // -----------------------------------------------------------------------------
 // TITLE
-//   HumanMouse — full "human" sequence (curved move → reaction → click)
-//   Runs on its own single-thread executor; plugin remains thin.
-//
-// WHAT THIS CLASS DOES
-//   • Builds a curved path from last-known mouse position to target,
-//     then asks MouseGateway to dispatch MOUSE_MOVED events along it.
-//   • Sleeps a Gaussian “reaction” BEFORE pressing — prevents yellow clicks.
-//   • Optionally presses Shift around the click with configurable waits.
-//   • Emits a tap sink callback so you can log to JSONL or HUD.
-//   • Provides hull/rect/point helpers for common targets.
-//
-// RUNTIME TUNING (from your plugin startUp()):
-//   humanMouse.setTapSink(p -> SyntheticTapLogger.log(p.x, p.y));
-//   humanMouse.setShiftWaitsMs(30, 30); // or setShiftGaussian(...)
-//   humanMouse.setStepRange(6, 12);
-//   humanMouse.setReaction(120, 40);
-//   humanMouse.setHoldRange(30, 55);
-// ============================================================================
-
+//   HumanMouse — Unified "human feel" executor (curved move → reaction → click)
+// -----------------------------------------------------------------------------
 package ht.heist.corerl.input;
+
+import ht.heist.corejava.api.input.Humanizer;
+import ht.heist.corejava.input.HumanizerImpl;
+import ht.heist.corejava.logging.HeistLog;
+
+import org.slf4j.Logger;  // <-- IMPORTANT: SLF4J (not java.util)
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -31,54 +21,27 @@ import java.awt.Rectangle;
 import java.awt.Shape;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Random;
 import java.util.concurrent.*;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 
 @Singleton
 public class HumanMouse
 {
-    // ---- IO bridge that actually dispatches AWT events onto RL canvas -------
-    private final MouseGateway io;
+    private static final Logger log = HeistLog.get(HumanMouse.class);
 
-    // ---- Worker thread so we never block the game thread --------------------
+    private final MouseGateway io;
+    private final Humanizer humanizer;
     private final ExecutorService exec;
 
-    // ---- Random source -------------------------------------------------------
-    private final Random rng = new Random();
-
-    // ---- Tap sink (optional) -------------------------------------------------
     private volatile Consumer<Point> tapSink = null;
-
-    // ---- “Feel” defaults (tunable) ------------------------------------------
-    // Step pacing while moving along the curve
-    private volatile int stepMinMs = 6;
-    private volatile int stepMaxMs = 12;
-
-    // Reaction pause BEFORE pressing (Gaussian)
-    private volatile int reactMeanMs = 120;
-    private volatile int reactStdMs  = 40;
-
-    // Mouse button hold duration range
-    private volatile int holdMinMs = 30;
-    private volatile int holdMaxMs = 55;
-
-    // Shift timing (either FIXED waits or GAUSSIAN with minimums)
-    private volatile boolean useShiftGaussian = false;
-    // Fixed mode
-    private volatile int shiftLeadFixedMs = 20; // wait after Shift down, before press
-    private volatile int shiftLagFixedMs  = 20; // wait after release, before Shift up
-    // Gaussian mode (with minimums)
-    private volatile int shiftLeadMinMs = 10, shiftLeadMeanMs = 25, shiftLeadStdMs = 8;
-    private volatile int shiftLagMinMs  = 10, shiftLagMeanMs  = 25, shiftLagStdMs  = 8;
-
-    // We don’t query RL for current mouse; track last target so consecutive moves feel smooth
     private volatile Point lastMouse = null;
 
     @Inject
     public HumanMouse(MouseGateway io)
     {
         this.io = io;
+        this.humanizer = new HumanizerImpl();
         this.exec = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "Heist-HumanMouse");
             t.setDaemon(true);
@@ -86,139 +49,94 @@ public class HumanMouse
         });
     }
 
-    // =========================================================================
-    // PUBLIC API — TARGET HELPERS
-    // =========================================================================
-
-    /** Click inside a convex hull (or any Shape polygon) with human timing. */
+    /** Click inside a polygonal hull with human-like motion + reaction. */
     public void clickHull(Shape hull, boolean shift)
     {
         if (hull == null) return;
         Rectangle b = hull.getBounds();
-        Point target = gaussianPointInShape(hull, b);
+        Point target = pickPointInShapeGaussian(hull);
         submitMoveReactClick(target, shift);
+        HeistLog.diag(log, "clickHull", "x", target.x, "y", target.y, "w", b.width, "h", b.height);
     }
 
-    /** Click within a UI rectangle (widgets, minimap, inventory slots). */
+    /** Click inside a rectangle (widgets, inventory slots, minimap). */
     public void clickRect(Rectangle rect, boolean shift)
     {
         if (rect == null) return;
-        Point target = gaussianPointInRect(rect);
+        final int cx = (int)Math.round(rect.getCenterX());
+        final int cy = (int)Math.round(rect.getCenterY());
+        Point target = new Point(
+                clampGaussianWithin(cx, rect.x, rect.x + rect.width  - 1, rect.width  / 4.0),
+                clampGaussianWithin(cy, rect.y, rect.y + rect.height - 1, rect.height / 4.0)
+        );
         submitMoveReactClick(target, shift);
+        HeistLog.diag(log, "clickRect", "x", target.x, "y", target.y, "w", rect.width, "h", rect.height);
     }
 
-    /** Click a specific canvas point. */
+    /** Click exactly at a canvas point. */
     public void clickPoint(Point target, boolean shift)
     {
         if (target == null) return;
         submitMoveReactClick(target, shift);
+        HeistLog.diag(log, "clickPoint", "x", target.x, "y", target.y);
     }
 
-    // =========================================================================
-    // RUNTIME TUNING
-    // =========================================================================
-
-    /** Sink for synthetic taps (e.g., JSONL logger or HUD). Called before press. */
     public void setTapSink(Consumer<Point> sink) { this.tapSink = sink; }
+    public Humanizer getHumanizer() { return humanizer; }
 
-    /** Fixed waits around Shift in milliseconds (lead = after Shift down, lag = before Shift up). */
-    public void setShiftWaitsMs(int leadMs, int lagMs)
-    {
-        this.useShiftGaussian = false;
-        this.shiftLeadFixedMs = Math.max(0, leadMs);
-        this.shiftLagFixedMs  = Math.max(0, lagMs);
-    }
-
-    /**
-     * Gaussian waits with per-side minimums.
-     * leadMs = max(minLead, N(meanLead, stdLead)), lagMs = max(minLag, N(meanLag, stdLag)).
-     */
-    public void setShiftGaussian(int minLead, int meanLead, int stdLead,
-                                 int minLag,  int meanLag,  int stdLag)
-    {
-        this.useShiftGaussian = true;
-        this.shiftLeadMinMs = Math.max(0, minLead);
-        this.shiftLeadMeanMs = Math.max(0, meanLead);
-        this.shiftLeadStdMs  = Math.max(0, stdLead);
-        this.shiftLagMinMs = Math.max(0, minLag);
-        this.shiftLagMeanMs = Math.max(0, meanLag);
-        this.shiftLagStdMs  = Math.max(0, stdLag);
-    }
-
-    /** Step pacing while moving along the curve. */
-    public void setStepRange(int minMs, int maxMs)
-    {
-        this.stepMinMs = Math.max(1, Math.min(minMs, maxMs));
-        this.stepMaxMs = Math.max(this.stepMinMs, maxMs);
-    }
-
-    /** Reaction pause BEFORE pressing (Gaussian). */
-    public void setReaction(int meanMs, int stdMs)
-    {
-        this.reactMeanMs = Math.max(0, meanMs);
-        this.reactStdMs  = Math.max(0, stdMs);
-    }
-
-    /** Mouse button hold range. */
-    public void setHoldRange(int minMs, int maxMs)
-    {
-        this.holdMinMs = Math.max(1, Math.min(minMs, maxMs));
-        this.holdMaxMs = Math.max(this.holdMinMs, maxMs);
-    }
-
-    // =========================================================================
-    // INTERNAL — WORKER SEQUENCE
-    // =========================================================================
-
+    // -- main sequence (curved move → ease-in → reaction → click) ------------
     private void submitMoveReactClick(Point target, boolean shift)
     {
         exec.submit(() -> {
-            try
-            {
-                // Build a curved path from lastKnown -> target
-                Point from = (lastMouse != null ? lastMouse : target);
-                List<Point> path = planPath(from, target);
+            try {
+                final Point from = (lastMouse != null ? lastMouse : target);
+                List<Point> path = planPathLocally(from, target);
 
-                // Move along curve (MouseGateway will dispatch MOUSE_MOVED events)
-                io.moveAlong(path, stepMinMs, stepMaxMs);
+                if (ThreadLocalRandom.current().nextDouble() < humanizer.overshootProb()) {
+                    Point over = overshootPoint(from, target, humanizer.overshootMaxPx());
+                    path.addAll(planPathLocally(path.isEmpty()? from : path.get(path.size()-1), over));
+                    sleepGaussian(humanizer.correctionPauseMeanMs(), humanizer.correctionPauseStdMs());
+                    path.addAll(planPathLocally(over, target));
+                }
 
-                // Reaction BEFORE press (prevents yellow clicks)
-                sleepGaussian(reactMeanMs, reactStdMs);
+                final int stepMin = humanizer.stepMinMs();
+                final int stepMax = humanizer.stepMaxMs();
+                moveWithEaseIn(path, stepMin, stepMax, humanizer.approachEaseIn());
 
-                // Emit tap to sink just before pressing
+                final int reactMean = applyFatigueToMean(
+                        humanizer.reactionMeanMs(), humanizer.fatigueLevel(), 0.25);
+                final int reactStd  = humanizer.reactionStdMs();
+                sleepGaussian(reactMean, reactStd);
+
                 Consumer<Point> sink = this.tapSink;
                 if (sink != null) {
                     try { sink.accept(target); } catch (Throwable ignored) {}
                 }
 
-                // Optional Shift around the click
-                if (shift)
-                {
+                final int holdMin = humanizer.holdMinMs();
+                final int holdMax = humanizer.holdMaxMs();
+                if (shift) {
                     io.shiftDown();
-                    sleepMillis(sampleShiftLeadMs());   // let OSRS register Shift
-                    io.clickAt(target, holdMinMs, holdMaxMs, true);
-                    sleepMillis(sampleShiftLagMs());    // small settle before releasing Shift
+                    sleepMillis(humanizer.keyLeadMs());
+                    io.clickAt(target, holdMin, holdMax, true);
+                    sleepMillis(humanizer.keyLagMs());
                     io.shiftUp();
-                }
-                else
-                {
-                    io.clickAt(target, holdMinMs, holdMaxMs, false);
+                } else {
+                    io.clickAt(target, holdMin, holdMax, false);
                 }
 
-                // Track last mouse for next arc
                 lastMouse = target;
-            }
-            catch (InterruptedException ie) {
+            } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
+            } catch (Throwable e) {
+                HeistLog.diag(log, "humanmouse_error", "reason", e.getClass().getSimpleName());
+                log.warn("HumanMouse sequence error (continuing)", e);
             }
         });
     }
 
-    // =========================================================================
-    // PATH PLANNING — quadratic curve + tiny wobble
-    // =========================================================================
-
-    private List<Point> planPath(Point from, Point to)
+    // -- path planning (Bezier-ish curve + micro wobble) ---------------------
+    private List<Point> planPathLocally(Point from, Point to)
     {
         final ArrayList<Point> out = new ArrayList<>();
         if (to == null) return out;
@@ -227,102 +145,117 @@ public class HumanMouse
         final int dist  = (int)Math.round(from.distance(to));
         final int steps = clamp(dist / 12, 6, 28);
 
-        final double curvature = 0.55;
-        final double noisePx   = 1.6;
+        final double curvature = humanizer.samplePathCurvature();
+        final double noisePx   = humanizer.pathWobblePx();
 
         final double dx = to.x - from.x, dy = to.y - from.y;
         final double len = Math.hypot(dx, dy);
-        final double ux = (len == 0) ? 0 : (-dy / len);
-        final double uy = (len == 0) ? 0 : ( dx / len);
+        final double ux  = (len == 0) ? 0 : (-dy / len);
+        final double uy  = (len == 0) ? 0 : ( dx / len);
 
-        final double side = (rng.nextBoolean() ? 1.0 : -1.0);
+        final double side = (ThreadLocalRandom.current().nextBoolean() ? 1.0 : -1.0);
         final double cx = from.x + dx * 0.5 + side * curvature * 0.25 * len * ux;
         final double cy = from.y + dy * 0.5 + side * curvature * 0.25 * len * uy;
 
         for (int i = 1; i <= steps; i++)
         {
-            final double t = i / (double)(steps + 1);
-            final double omt = 1.0 - t;
+            final double t  = i / (double)(steps + 1);
+            final double omt= 1.0 - t;
+
             double bx = omt*omt*from.x + 2.0*omt*t*cx + t*t*to.x;
             double by = omt*omt*from.y + 2.0*omt*t*cy + t*t*to.y;
-            bx += (rng.nextDouble() * 2 - 1) * noisePx;
-            by += (rng.nextDouble() * 2 - 1) * noisePx;
+
+            bx += (ThreadLocalRandom.current().nextDouble() * 2 - 1) * noisePx;
+            by += (ThreadLocalRandom.current().nextDouble() * 2 - 1) * noisePx;
+
             out.add(new Point((int)Math.round(bx), (int)Math.round(by)));
         }
-        out.add(new Point(to));
         return out;
     }
 
-    // =========================================================================
-    // POINT SAMPLERS — 2D Gaussian with containment checks
-    // =========================================================================
-
-    private Point gaussianPointInRect(Rectangle r)
+    private Point pickPointInShapeGaussian(Shape shape)
     {
-        double meanX = r.getCenterX();
-        double meanY = r.getCenterY();
-        double stdX  = Math.max(1.0, r.getWidth()  / 4.0);
-        double stdY  = Math.max(1.0, r.getHeight() / 4.0);
+        final Rectangle r = shape.getBounds();
+        if (r == null) return new Point(0, 0);
+
+        final double[] bias = humanizer.stepBiasDrift();
+        final double bx = (bias != null && bias.length >= 2) ? bias[0] : 0.0;
+        final double by = (bias != null && bias.length >= 2) ? bias[1] : 0.0;
+
+        final double cx = r.getCenterX(), cy = r.getCenterY();
+        final double sx = Math.max(1.0, r.getWidth()  * 0.32 / 2.0);
+        final double sy = Math.max(1.0, r.getHeight() * 0.36 / 2.0);
 
         for (int i = 0; i < 10; i++) {
-            int x = (int)Math.round(rng.nextGaussian() * stdX + meanX);
-            int y = (int)Math.round(rng.nextGaussian() * stdY + meanY);
-            if (r.contains(x, y)) return new Point(x, y);
+            final double gx = cx + bx + sx * gauss();
+            final double gy = cy + by + sy * gauss();
+            final int px = (int)Math.round(gx), py = (int)Math.round(gy);
+            if (shape.contains(px, py)) return new Point(px, py);
         }
-        return new Point((int)meanX, (int)meanY);
+        return new Point((int)cx, (int)cy);
     }
 
-    private Point gaussianPointInShape(Shape shape, Rectangle bounds)
+    /** Move along path with slight slow-down near the end (ease-in). */
+    private void moveWithEaseIn(List<Point> path, int minMs, int maxMs, double easeIn01) throws InterruptedException
     {
-        if (shape == null || bounds == null) return new Point(0, 0);
-        double meanX = bounds.getCenterX();
-        double meanY = bounds.getCenterY();
-        double stdX  = Math.max(1.0, bounds.getWidth()  / 4.0);
-        double stdY  = Math.max(1.0, bounds.getHeight() / 4.0);
+        if (path == null || path.isEmpty()) return;
 
-        for (int i = 0; i < 10; i++) {
-            int x = (int)Math.round(rng.nextGaussian() * stdX + meanX);
-            int y = (int)Math.round(rng.nextGaussian() * stdY + meanY);
-            if (shape.contains(x, y)) return new Point(x, y);
+        final int n = path.size();
+        for (int i = 0; i < n; i++) {
+            final Point p = path.get(i);
+            io.dispatchMove(p); // helper in MouseGateway (see patch below)
+
+            final double t = (i + 1) / (double) n;
+            final double ease = 1.0 + Math.max(0.0, Math.min(1.0, easeIn01)) * t * t;
+            final int base = uniform(minMs, maxMs);
+            final int d = (int)Math.round(base * ease);
+            if (d > 0) Thread.sleep(d);
         }
-        return new Point((int)meanX, (int)meanY);
     }
 
-    // =========================================================================
-    // SMALL UTILS
-    // =========================================================================
-
-    private int sampleShiftLeadMs()
-    {
-        if (!useShiftGaussian) return shiftLeadFixedMs;
-        int g = (int)Math.round(reactSample(shiftLeadMeanMs, shiftLeadStdMs));
-        return Math.max(shiftLeadMinMs, g);
+    private Point overshootPoint(Point from, Point to, double maxPx) {
+        double dx = to.x - from.x, dy = to.y - from.y;
+        double len = Math.hypot(dx, dy);
+        if (len < 1e-6) return new Point(to);
+        double ux = dx / len, uy = dy / len;
+        double m  = ThreadLocalRandom.current().nextDouble(Math.max(1.0, maxPx * 0.35), Math.max(maxPx, 1.0));
+        return new Point((int)Math.round(to.x + ux * m), (int)Math.round(to.y + uy * m));
     }
 
-    private int sampleShiftLagMs()
-    {
-        if (!useShiftGaussian) return shiftLagFixedMs;
-        int g = (int)Math.round(reactSample(shiftLagMeanMs, shiftLagStdMs));
-        return Math.max(shiftLagMinMs, g);
+    // -- small utils ----------------------------------------------------------
+    private static int uniform(int min, int max) {
+        if (max < min) { int t = min; min = max; max = t; }
+        if (min <= 0 && max <= 0) return 0;
+        return ThreadLocalRandom.current().nextInt(Math.max(0, min), Math.max(0, max) + 1);
     }
 
-    private void sleepGaussian(int meanMs, int stdMs) throws InterruptedException
-    {
-        int d = (int)Math.max(0, Math.round(reactSample(meanMs, stdMs)));
-        Thread.sleep(d);
+    private static void sleepMillis(int ms) throws InterruptedException {
+        if (ms > 0) Thread.sleep(ms);
     }
 
-    private double reactSample(int mean, int std)
-    {
-        // Absolute to avoid accidental negatives on rare large negative draws.
-        return Math.abs(mean + rng.nextGaussian() * std);
+    private static void sleepGaussian(int meanMs, int stdMs) throws InterruptedException {
+        int d = (int)Math.max(0, Math.round(meanMs + gauss() * stdMs));
+        if (d > 0) Thread.sleep(d);
     }
 
-    private static void sleepMillis(int ms) throws InterruptedException
-    {
-        if (ms <= 0) return;
-        Thread.sleep(ms);
+    private static double gauss() {
+        double u = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
+        double v = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
+        return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2 * Math.PI * v);
     }
 
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    private static int clampGaussianWithin(int center, int lo, int hi, double std) {
+        for (int i = 0; i < 6; i++) {
+            int v = (int)Math.round(center + gauss() * std);
+            if (v >= lo && v <= hi) return v;
+        }
+        return Math.max(lo, Math.min(hi, center));
+    }
+
+    private static int applyFatigueToMean(int mean, double fatigue01, double maxPct) {
+        double mult = 1.0 + Math.max(0.0, Math.min(1.0, fatigue01)) * Math.max(0.0, maxPct);
+        return (int)Math.round(mean * mult);
+    }
 }

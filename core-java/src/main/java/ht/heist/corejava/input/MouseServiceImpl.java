@@ -1,32 +1,22 @@
 // ============================================================================
 // FILE: MouseServiceImpl.java
-// MODULE: core-java (PURE Java; NO RuneLite)
+// PATH: core-java/src/main/java/ht/heist/corejava/input/MouseServiceImpl.java
 // PACKAGE: ht.heist.corejava.input
 // -----------------------------------------------------------------------------
 // TITLE
-//   MouseServiceImpl — human-like path planner that delegates "feel" to Humanizer.
+//   MouseServiceImpl — Human-like path planner driven entirely by Humanizer
 //
-// WHAT CHANGED IN PHASE A.1
-//   • All *knobs/randomness* (timings, curvature, wobble, step pacing, drift)
-//     are now provided by Humanizer. This class no longer hard-codes constants.
-//   • Behavior is intentionally identical to your previous version when paired
-//     with HumanizerImpl’s default parameters.
+// WHAT THIS CLASS DOES
+//   • Provides target-point sampling inside shapes (center-biased).
+//   • Plans curved paths with micro-wobble; per-path curvature JITTER (NEW).
+//   • Exposes timing ranges via planTimings(), all sourced from Humanizer.
 //
-// WHY THIS IS GOOD
-//   • Centralization: tweak "feel" in one place (Humanizer) and it propagates.
-//   • Future-ready: swap HumanizerImpl for a learned HumanProfile without
-//     touching planners or plugins.
-//
-// CONSTRUCTORS
-//   • MouseServiceImpl(Humanizer) — preferred.
-//   • MouseServiceImpl() — convenience; creates a default HumanizerImpl.
+// WHY THIS MATTERS
+//   Curvature is now sampled per path using Humanizer.samplePathCurvature(),
+//   which gives natural arc variety and avoids identical-looking moves.
 //
 // THREADING
-//   • Stateless aside from local computations; Humanizer maintains tiny drift
-//     state internally. Typical usage is from a single input thread.
-//
-// NOTE
-//   • This is still PURE Java — no RuneLite classes imported here.
+//   Stateless aside from reading the Humanizer (which holds tiny state).
 // ============================================================================
 
 package ht.heist.corejava.input;
@@ -45,8 +35,6 @@ public final class MouseServiceImpl implements MouseService
 {
     private final Humanizer humanizer;
 
-    // ---- Constructors -------------------------------------------------------
-
     /** Preferred: supply the Humanizer you want (static profile, learned, etc.). */
     public MouseServiceImpl(Humanizer humanizer) {
         if (humanizer == null) throw new IllegalArgumentException("humanizer == null");
@@ -58,15 +46,15 @@ public final class MouseServiceImpl implements MouseService
         this(new HumanizerImpl());
     }
 
-    // =========================================================================
-    // API: pickPointInShape — sample inside a polygon with tiny sticky bias
-    // =========================================================================
+    // ------------------------------------------------------------------------
+    // pickPointInShape — Elliptical Gaussian sampling with tiny sticky bias
+    // ------------------------------------------------------------------------
     @Override
     public Point pickPointInShape(Shape shape)
     {
         if (shape == null) return new Point(0, 0);
 
-        // Get a tiny sticky bias from Humanizer’s AR(1) drift (already clamped).
+        // Tiny sticky bias from Humanizer AR(1) drift (already clamped)
         final double[] bias = humanizer.stepBiasDrift();
         final double bx = (bias != null && bias.length >= 2) ? bias[0] : 0.0;
         final double by = (bias != null && bias.length >= 2) ? bias[1] : 0.0;
@@ -74,19 +62,17 @@ public final class MouseServiceImpl implements MouseService
         final Rectangle r = shape.getBounds();
 
         // Elliptical Gaussian sampling within bounds, nudged by bias.
-        // We use 0.32x / 0.36y of the bounding box, matching prior behavior.
-        for (int i = 0; i < 10; i++)
-        {
+        for (int i = 0; i < 10; i++) {
             Point p = sampleEllipticalInRect(r, 0.32, 0.36, bx, by);
             if (shape.contains(p)) return p;
         }
-        // If numeric walls or a degenerate shape break sampling, fall back to center.
+        // Fallback to center if numeric/pathological cases occur.
         return new Point((int) r.getCenterX(), (int) r.getCenterY());
     }
 
-    // =========================================================================
-    // API: planPath — curved arc with micro-wobble; per-move pacing from Humanizer
-    // =========================================================================
+    // ------------------------------------------------------------------------
+    // planPath — Quadratic arc w/ micro wobble; curvature sampled per path (NEW)
+    // ------------------------------------------------------------------------
     @Override
     public MousePlan planPath(Point from, Point to)
     {
@@ -99,22 +85,22 @@ public final class MouseServiceImpl implements MouseService
         if (from == null)
             return new MousePlan(List.of(new Point(to)), minStep, maxStep);
 
-        // Steps based on distance (same heuristic as before).
         final int dist  = (int)Math.round(from.distance(to));
         final int steps = clamp(dist / 12, 6, 28);
 
-        final double curvature = humanizer.pathCurvature();
+        // ---- NEW: curvature jitter per path --------------------------------
+        final double curvature = humanizer.samplePathCurvature();
         final double wobblePx  = humanizer.pathWobblePx();
 
         final List<Point> path = curvedPath(from, to, steps, curvature, wobblePx);
-        path.add(new Point(to)); // ensure final target is included
+        path.add(new Point(to)); // ensure final target included
 
         return new MousePlan(path, minStep, maxStep);
     }
 
-    // =========================================================================
-    // API: planTimings — expose Humanizer’s timing knobs to the executor
-    // =========================================================================
+    // ------------------------------------------------------------------------
+    // planTimings — expose Humanizer's timing knobs to the executor
+    // ------------------------------------------------------------------------
     @Override
     public Timings planTimings()
     {
@@ -125,9 +111,9 @@ public final class MouseServiceImpl implements MouseService
         );
     }
 
-    // =========================================================================
-    // Internals: geometry & randomness (unchanged logic, knobs come from Humanizer)
-    // =========================================================================
+    // ------------------------------------------------------------------------
+    // Internals: geometry & randomness
+    // ------------------------------------------------------------------------
 
     /** Elliptical Gaussian sampling bounded to a rectangle; bias nudges the mean. */
     private static Point sampleEllipticalInRect(Rectangle r, double rx, double ry, double biasX, double biasY)
@@ -136,8 +122,7 @@ public final class MouseServiceImpl implements MouseService
         final double sx = Math.max(1.0, (r.getWidth()  * rx) / 2.0);
         final double sy = Math.max(1.0, (r.getHeight() * ry) / 2.0);
 
-        for (int i = 0; i < 8; i++)
-        {
+        for (int i = 0; i < 8; i++) {
             final double gx = cx + biasX + sx * gauss();
             final double gy = cy + biasY + sy * gauss();
             final int px = (int)Math.round(gx), py = (int)Math.round(gy);
@@ -164,8 +149,7 @@ public final class MouseServiceImpl implements MouseService
         final double cx = from.x + dx * 0.5 + side * curvature * 0.25 * len * ux;
         final double cy = from.y + dy * 0.5 + side * curvature * 0.25 * len * uy;
 
-        for (int i = 1; i <= steps; i++)
-        {
+        for (int i = 1; i <= steps; i++) {
             final double t  = i / (double)(steps + 1);
             final double omt= 1.0 - t;
 
@@ -182,8 +166,7 @@ public final class MouseServiceImpl implements MouseService
         return out;
     }
 
-    private static double gauss()
-    {
+    private static double gauss() {
         double u = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
         double v = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
         return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2 * Math.PI * v);

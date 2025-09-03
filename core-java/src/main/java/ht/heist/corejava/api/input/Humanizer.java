@@ -1,82 +1,109 @@
 // ============================================================================
 // FILE: Humanizer.java
-// MODULE: core-java (PURE Java; NO RuneLite)
+// PATH: core-java/src/main/java/ht/heist/corejava/api/input/Humanizer.java
 // PACKAGE: ht.heist.corejava.api.input
 // -----------------------------------------------------------------------------
 // TITLE
-//   Humanizer — single source of truth for "human feel" knobs + randomization.
+//   Humanizer — Centralized "human feel" parameters and samplers
 //
-// WHAT THIS INTERFACE IS
-//   • A tiny API that *owns all randomness and behavioral knobs* your input
-//     system uses (timing, path shape, micro-wobble, drift bias, step pacing).
-//   • Implementations can be:
-//       - Static (fixed distributions/knobs)
-//       - Profile-driven (learned from your JSON logs later)
-//       - Context-aware (e.g., different style for inventory vs scene clicks)
+// WHAT THIS INTERFACE DEFINES
+//   This is the SINGLE source of truth for all "human-like" behavior knobs that
+//   affect mouse/timing dynamics. Implementations (e.g., HumanizerImpl) provide
+//   concrete numbers and sampling behavior.
 //
 // WHY THIS EXISTS
-//   • Plugins/controllers should NOT decide "how human" feels.
-//   • Mouse path planners and executors should NOT hard-code constants.
-//   • By centralizing here, you can swap implementations without touching
-//     movement or higher-level logic.
+//   Previously, multiple classes (MouseServiceImpl, HumanMouse) each contained
+//   their own scattered knobs. Consolidating all knobs/samplers here:
+//     • avoids duplicated constants,
+//     • makes it easy to load/learn a per-user "profile",
+//     • ensures plugins remain thin and depend on ONE feel provider.
 //
-// LIFECYCLE / THREADING
-//   • Implementations may keep small mutable state (e.g., AR(1) drift).
-//   • Expected to be used from a single input thread, but the API itself is
-//     simple enough to remain thread-safe in practice.
+// THREADING
+//   Implementations may maintain tiny state (e.g., sticky drift). Calls are
+//   expected from a single input thread, but implementations should be simple
+//   and robust.
 //
-// API SHAPE NOTES
-//   • We expose *knobs* (e.g., min/max, means/std) rather than single samples,
-//     because some planners prefer to sample internally while others just need
-//     ranges. You can extend with sampleX() helpers later if desired.
-//   • For the sticky "bias" drift used when sampling inside a shape, we expose
-//     a step() that returns the *current clamped bias* each call.
+// BACKWARD COMPATIBILITY
+//   Existing getters are preserved (dwellMinMs(), etc.). New getters are added
+//   for curvature jitter, overshoot/correction, ease-in pacing, fatigue, and
+//   session lifecycle.
 // ============================================================================
 
 package ht.heist.corejava.api.input;
 
 public interface Humanizer
 {
-    // ---- TIMING KNOBS -------------------------------------------------------
-    // All values in milliseconds. These are "design intents" rather than
-    // hard guarantees — your executor may still clamp for safety.
+    // ------------------------------------------------------------------------
+    // TIMING KNOBS (RANGES and STATS)
+    // These inform the executor's sleeps. They should reflect human-like
+    // distributions and minimum floors to avoid robotic behavior.
+    // ------------------------------------------------------------------------
 
-    /** Hover BEFORE press (lets OSRS highlight the target), e.g. 240..360 ms. */
+    /** Minimum and maximum hover time BEFORE mouse press (ms). */
     int dwellMinMs();
     int dwellMaxMs();
 
-    /** Reaction jitter BEFORE press; mean/std for a Gaussian sample, e.g. 150±45 ms. */
+    /** Reaction delay mean/std (ms) BEFORE the press (Gaussian-ish). */
     int reactionMeanMs();
     int reactionStdMs();
 
-    /** Press/hold duration (mouse down time), e.g. 42..65 ms. */
+    /** Minimum and maximum button hold duration (ms). */
     int holdMinMs();
     int holdMaxMs();
 
-    // ---- PATH & PACING KNOBS -----------------------------------------------
-    /** Curvature amount for the arc toward target (0 = straight line). */
+    /** Optional Shift key waits around press (lead = after Shift down, before press; lag = before Shift up). */
+    int keyLeadMs();   // can be sampled internally; return a single value for this call
+    int keyLagMs();    // can be sampled internally; return a single value for this call
+
+    // ------------------------------------------------------------------------
+    // PATH & PACING KNOBS
+    // ------------------------------------------------------------------------
+
+    /** Mean/Std for per-path curvature jitter (0.0 = straight; ~0.5 moderate arc). */
+    double pathCurvatureMean();
+    double pathCurvatureStd();
+
+    /** Legacy curvature value for compatibility; implementations may return mean. */
     double pathCurvature();
 
-    /** Tiny micro-wobble amplitude along the curve (in pixels). */
+    /** Amplitude of micro-wobble noise (pixels) along the path. */
     double pathWobblePx();
 
-    /** Per-move sleep bounds (smoothness). Typical: 6..12 ms per step. */
+    /** Per-step pacing bounds while moving (ms between MOUSE_MOVED points). */
     int stepMinMs();
     int stepMaxMs();
 
-    // ---- STICKY BIAS DRIFT --------------------------------------------------
-    // We often want shape sampling to feel "sticky" toward the center with a
-    // tiny inertia. This AR(1)-style bias is advanced each call and returns
-    // the current clamped bias used when picking a point inside a shape.
-
-    /**
-     * Advance the 2D drift state and return the current clamped bias (bx, by).
-     * Units are pixels, but *very* small (e.g., -3..+3) — meant to be added as
-     * a tiny center bias when picking a point inside a polygon.
-     *
-     * Implementations typically do: drift = alpha*drift + noise*Gaussian().
-     *
-     * @return double[2] of { biasX, biasY }, already clamped.
-     */
+    /** Tiny AR(1) drift that evolves across calls; returns [biasX, biasY] px. */
     double[] stepBiasDrift();
+
+    /** Ease-in near the target (0..1). 0=constant speed; 1=strong slow-down near end. */
+    double approachEaseIn();
+
+    /** Convenience sampler: per-path curvature draw honoring mean/std. */
+    double samplePathCurvature();
+
+    // ------------------------------------------------------------------------
+    // OVERSHOOT / CORRECTION (make approaches less robotic)
+    // ------------------------------------------------------------------------
+
+    /** Probability of performing a small overshoot before correcting to target. */
+    double overshootProb();
+
+    /** Maximum overshoot distance in pixels along the movement direction. */
+    double overshootMaxPx();
+
+    /** Pause between overshoot and correction (Gaussian mean/std, ms). */
+    int correctionPauseMeanMs();
+    int correctionPauseStdMs();
+
+    // ------------------------------------------------------------------------
+    // FATIGUE & SESSION LIFECYCLE
+    // ------------------------------------------------------------------------
+
+    /** Fatigue in [0..1]. Implementations decide how it modulates timings. */
+    double fatigueLevel();
+    void   setFatigueLevel(double f);
+
+    /** Called when a session starts: reset drift or other state to "fresh". */
+    void   onSessionStart();
 }

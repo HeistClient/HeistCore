@@ -1,44 +1,29 @@
 // ============================================================================
 // FILE: WoodcutterPlugin.java
-// MODULE: woodcutter-plugin
+// PATH: woodcutter-plugin/src/main/java/ht/heist/plugins/woodcutter/WoodcutterPlugin.java
 // PACKAGE: ht.heist.plugins.woodcutter
 // -----------------------------------------------------------------------------
 // TITLE
-//   Heist Woodcutter (Thin, HUD-Decoupled)
+//   Heist Woodcutter (Thin, Unified Feel, With Session Reset + Idle/Fatigue)
+//
+// WHAT THIS FILE ADDS
+//   • Calls humanizer.onSessionStart() at plugin start (resets drift each run).
+//   • Uses IdleController to occasionally pause + gradually increase fatigue.
+//   • Adds a simple "LoS" check via CameraService before clicking trees.
+//   • Wraps risky sections with structured logs (HeistLog.diag) + guardrails.
 // -----------------------------------------------------------------------------
-// WHAT THIS DOES
-//   • Finds the nearest tree (core-rl TreeDetector + your config TreeType)
-//   • Delegates the *entire* click pipeline to core-rl HumanMouse
-//       (curved move → reaction BEFORE press → short hold → optional Shift)
-//   • On startup, wires HumanMouse's tap-sink to SyntheticTapLogger so every
-//     tap is written to JSONL; Heist HUD tails that file to draw the heatmap.
-//   • If inventory fills, shift-drops one log per loop using HumanMouse.clickRect.
-// -----------------------------------------------------------------------------
-// WHY THIS VERSION
-//   • Removes direct references to heist-hud (HeatmapService), eliminating the
-//     compile errors you saw: "Cannot resolve symbol HeatmapService" / addLiveTap.
-//   • HUD integration now happens *only* through the JSONL file (clean boundary).
-// -----------------------------------------------------------------------------
-// REQUIREMENTS (already in your repo):
-//   • ht.heist.corerl.input.HumanMouse
-//   • ht.heist.corerl.object.TreeDetector / TreeType
-//   • ht.heist.plugins.woodcutter.io.SyntheticTapLogger (your JSONL writer)
-// -----------------------------------------------------------------------------
-// HUD SETUP REMINDER
-//   In the Heist HUD config:
-//     - Read JSONL taps: ON
-//     - JSONL path: must match your SyntheticTapLogger path
-//     - Show heatmap (and layers): ON
-//     - Palette: as you prefer (Infrared or Red)
-// ============================================================================
-
 package ht.heist.plugins.woodcutter;
 
 import com.google.inject.Provides;
+import ht.heist.corerl.input.CameraService;
 import ht.heist.corerl.input.HumanMouse;
+import ht.heist.corerl.input.IdleController;
 import ht.heist.corerl.object.TreeDetector;
 import ht.heist.corerl.object.TreeType;
 import ht.heist.plugins.woodcutter.io.SyntheticTapLogger;
+import ht.heist.corejava.logging.HeistLog;
+import org.slf4j.Logger;
+
 import net.runelite.api.*;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.widgets.Widget;
@@ -47,8 +32,6 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import java.awt.Shape;
@@ -58,23 +41,26 @@ import java.util.Random;
 
 @PluginDescriptor(
         name = "Heist Woodcutter",
-        description = "Cuts trees using core-rl HumanMouse; logs taps to JSONL for the HUD.",
+        description = "Cuts trees using unified HumanMouse feel; logs taps to JSONL for the HUD.",
         tags = {"heist","woodcutting"}
 )
 public class WoodcutterPlugin extends Plugin
 {
-    private static final Logger log = LoggerFactory.getLogger(WoodcutterPlugin.class);
+    // ---- Logger (SLF4J) -----------------------------------------------------
+    private static final Logger log = HeistLog.get(WoodcutterPlugin.class);
 
     // ---- Injected deps -------------------------------------------------------
     @Inject private Client client;
     @Inject private WoodcutterConfig config;
-    @Inject private HumanMouse humanMouse;                    // core-rl: move→react→press on worker
+    @Inject private HumanMouse humanMouse;                    // unified feel
     @Inject private SyntheticTapLogger syntheticTapLogger;    // JSONL writer (HUD tails this)
+    @Inject private IdleController idleController;            // small idle + fatigue drift
+    @Inject private CameraService cameraService;              // simple LoS check (expand later)
 
     // ---- State ---------------------------------------------------------------
     private enum State { STARTING, FINDING_TREE, VERIFYING, CHOPPING, INVENTORY }
     private State state = State.STARTING;
-    private long  wakeAt = 0L;                                // simple tick gate
+    private long  wakeAt = 0L;
 
     private GameObject targetTree = null;
     private final Random rng = new Random();
@@ -85,111 +71,147 @@ public class WoodcutterPlugin extends Plugin
         return cm.getConfig(WoodcutterConfig.class);
     }
 
-    // ---- Lifecycle -----------------------------------------------------------
+    // ------------------------------------------------------------------------
+    // LIFECYCLE
+    // ------------------------------------------------------------------------
     @Override
     protected void startUp()
     {
-        // 1) Feed synthetic taps → JSONL (HUD tail will show them on the heatmap)
+        // (A) Wire the synthetic tap sink → JSONL (HUD will tail that file)
         humanMouse.setTapSink(p -> {
             try { syntheticTapLogger.log(p.x, p.y); } catch (Throwable ignored) {}
         });
 
-        // 2) (Optional) feel tuning — safe defaults are already in HumanMouse
-        // humanMouse.setStepRange(6, 12);     // path step pacing (ms)
-        // humanMouse.setReaction(120, 40);    // pre-press reaction (gaussian)
-        // humanMouse.setHoldRange(30, 55);    // press/hold (ms)
-        // humanMouse.setShiftWaitsMs(30, 30); // if you need generous Shift windows
+        // (B) RESET SESSION FEEL:
+        //     This zeros the tiny AR(1) drift and resets fatigue to 0 so that
+        //     each plugin run starts fresh. THIS is the "session reset" wiring.
+        humanMouse.getHumanizer().onSessionStart();
+
+        // (C) Optional: you can set an initial fatigue if desired (0..1)
+        // humanMouse.getHumanizer().setFatigueLevel(0.0);
 
         state = State.FINDING_TREE;
-        log.info("Heist Woodcutter started (taps → JSONL; HUD tails file).");
+        HeistLog.diag(log, "woodcutter_start");
     }
 
     @Override
     protected void shutDown()
     {
         state = State.STARTING;
-        log.info("Heist Woodcutter stopped.");
+        HeistLog.diag(log, "woodcutter_stop");
     }
 
-    // ---- Tick loop (thin controller) ----------------------------------------
+    // ------------------------------------------------------------------------
+    // TICK LOOP
+    // ------------------------------------------------------------------------
     @Subscribe
     public void onGameTick(GameTick tick)
     {
+        // (D) Respect any "wakeAt" gate to avoid burning CPU or spamming actions
         if (System.currentTimeMillis() < wakeAt) return;
 
         final Player me = client.getLocalPlayer();
         if (client.getGameState() != GameState.LOGGED_IN || me == null) return;
 
-        switch (state)
-        {
-            case STARTING:
-            case FINDING_TREE:
-            {
-                final TreeType want = config.treeType();
-                targetTree = TreeDetector.findNearest(client, want);
+        // (E) OCCASIONAL HUMAN-LIKE IDLE + FATIGUE DRIFT
+        //     This is *optional* but adds realism; tweak IdleController to taste.
+        try {
+            long idleMs = idleController.maybeIdle();
+            if (idleMs > 0) Thread.sleep(idleMs);
+            // Gradually increase fatigue (affects reaction mean slightly)
+            double f = idleController.nextFatigue(humanMouse.getHumanizer().fatigueLevel());
+            humanMouse.getHumanizer().setFatigueLevel(f);
+        } catch (InterruptedException ignored) {}
 
-                if (targetTree == null)
+        try {
+            switch (state)
+            {
+                case STARTING:
+                case FINDING_TREE:
                 {
-                    // nothing in view; idle lightly
-                    wakeAt = System.currentTimeMillis() + 400 + rng.nextInt(400);
+                    final TreeType want = config.treeType();
+                    targetTree = TreeDetector.findNearest(client, want);
+
+                    if (targetTree == null)
+                    {
+                        // nothing in view; idle lightly and retry
+                        wakeAt = System.currentTimeMillis() + 400 + rng.nextInt(400);
+                        break;
+                    }
+
+                    // (F) Simple visibility gate: if not visible, nudge the camera (future work)
+                    if (!cameraService.isVisible(targetTree)) {
+                        // TODO: cameraService.face(targetTree) with small key/drag steps
+                        // For now, just back off a bit and retry; avoids blind clicking.
+                        HeistLog.diag(log, "tree_not_visible_retrying");
+                        wakeAt = System.currentTimeMillis() + 280 + rng.nextInt(220);
+                        break;
+                    }
+
+                    // (G) Delegate the entire click to HumanMouse (curved → reaction → press)
+                    clickGameObjectHull(targetTree);
+
+                    // Allow the worker to run a bit, then verify via animation
+                    state = State.VERIFYING;
+                    wakeAt = System.currentTimeMillis() + 900 + rng.nextInt(300);
                     break;
                 }
 
-                // Delegate the entire click to HumanMouse (worker thread):
-                clickGameObjectHull(targetTree);
-
-                // Allow the worker to run a bit, then verify via animation
-                state = State.VERIFYING;
-                wakeAt = System.currentTimeMillis() + 900 + rng.nextInt(300);
-                break;
-            }
-
-            case VERIFYING:
-            {
-                if (me.getAnimation() == currentAxeAnim())
+                case VERIFYING:
                 {
-                    state = State.CHOPPING;
+                    if (me.getAnimation() == currentAxeAnim())
+                    {
+                        state = State.CHOPPING;
+                    }
+                    else
+                    {
+                        // not animating and idle → try again
+                        if (me.getPoseAnimation() == me.getIdlePoseAnimation())
+                            state = State.FINDING_TREE;
+                    }
+                    break;
                 }
-                else
+
+                case CHOPPING:
                 {
-                    // not moving and no chop? try again
-                    if (me.getPoseAnimation() == me.getIdlePoseAnimation())
+                    if (me.getAnimation() != currentAxeAnim())
+                    {
+                        // chop ended/despawned
                         state = State.FINDING_TREE;
+                    }
+                    // inventory full? go drop
+                    if (isInventoryFull())
+                    {
+                        state = State.INVENTORY;
+                    }
+                    break;
                 }
-                break;
-            }
 
-            case CHOPPING:
-            {
-                if (me.getAnimation() != currentAxeAnim())
+                case INVENTORY:
                 {
-                    // chop ended/despawned
-                    state = State.FINDING_TREE;
+                    // Shift-drop one log per loop; HumanMouse handles Shift timing internally
+                    if (!dropOneLogIfPresent())
+                    {
+                        // nothing left to drop; resume cutting
+                        state = State.FINDING_TREE;
+                    }
+                    // brief human pause between drops
+                    wakeAt = System.currentTimeMillis() + 180 + rng.nextInt(120);
+                    break;
                 }
-                // inventory full? go drop
-                if (isInventoryFull())
-                {
-                    state = State.INVENTORY;
-                }
-                break;
             }
-
-            case INVENTORY:
-            {
-                // Shift-drop one log per loop; HumanMouse handles Shift timing internally
-                if (!dropOneLogIfPresent())
-                {
-                    // nothing left to drop; resume cutting
-                    state = State.FINDING_TREE;
-                }
-                // brief human pause between drops
-                wakeAt = System.currentTimeMillis() + 180 + rng.nextInt(120);
-                break;
-            }
+        } catch (Throwable t) {
+            // (H) GUARDRails + structured log line for fast triage
+            HeistLog.diag(log, "tick_error", "reason", t.getClass().getSimpleName());
+            log.warn("Woodcutter tick error (continuing)", t);
+            // small backoff to avoid tight error loops
+            wakeAt = System.currentTimeMillis() + 250;
         }
     }
 
-    // ---- Thin click helper (delegates to core-rl) ---------------------------
+    // ------------------------------------------------------------------------
+    // Thin click helper (delegates to HumanMouse)
+    // ------------------------------------------------------------------------
     private void clickGameObjectHull(GameObject obj)
     {
         if (obj == null) return;
@@ -199,7 +221,9 @@ public class WoodcutterPlugin extends Plugin
         humanMouse.clickHull(hull, /*shift=*/false);
     }
 
-    // ---- Inventory helpers (Shift-drop) -------------------------------------
+    // ------------------------------------------------------------------------
+    // Inventory helpers (Shift-drop)
+    // ------------------------------------------------------------------------
     private boolean dropOneLogIfPresent()
     {
         final Widget inv = client.getWidget(WidgetInfo.INVENTORY);
@@ -229,7 +253,9 @@ public class WoodcutterPlugin extends Plugin
         return inv != null && inv.count() >= 28;
     }
 
-    // ---- Axe animation lookup (unchanged) -----------------------------------
+    // ------------------------------------------------------------------------
+    // Axe animation lookup (unchanged)
+    // ------------------------------------------------------------------------
     private int currentAxeAnim()
     {
         final ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);

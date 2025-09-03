@@ -1,13 +1,4 @@
-<!--
-  ============================================================================
-  FILE: HeistCore/heist-hud/pom.xml
-  ROLE: Heist HUD RuneLite plugin (overlays + ingest)
-  PURPOSE:
-    • Depends on core-java (contracts/utilities).
-    • RuneLite dependencies are 'provided' by the host.
-    • Shades core-java into the plugin jar to keep it self-contained.
-  ============================================================================
--->
+<!-- Heist HUD plugin -->
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -25,14 +16,14 @@
     <name>Heist HUD</name>
 
     <dependencies>
-        <!-- Shade this so the HUD jar is self-contained -->
+        <!-- Shade this (your pure Java code) -->
         <dependency>
             <groupId>ht.heist</groupId>
             <artifactId>core-java</artifactId>
             <version>${project.version}</version>
         </dependency>
 
-        <!-- RuneLite (host-provided) -->
+        <!-- RuneLite provided by host -->
         <dependency>
             <groupId>net.runelite</groupId>
             <artifactId>client</artifactId>
@@ -45,22 +36,20 @@
             <version>${runelite.version}</version>
             <scope>provided</scope>
         </dependency>
+
+        <!-- DI annotations provided by host -->
         <dependency>
             <groupId>javax.inject</groupId>
             <artifactId>javax.inject</artifactId>
             <version>1</version>
             <scope>provided</scope>
         </dependency>
-        <dependency>
-            <groupId>ht.heist</groupId>
-            <artifactId>core-java</artifactId>
-            <version>${project.version}</version>
-        </dependency>
+
+        <!-- DO NOT add slf4j-api here; RL provides it -->
     </dependencies>
 
     <build>
         <plugins>
-            <!-- Clean jar name -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
@@ -70,11 +59,10 @@
                 </configuration>
             </plugin>
 
-            <!-- Shade ONLY core-java; never shade RL artifacts -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.5.0</version>
+                <version>3.5.1</version>
                 <executions>
                     <execution>
                         <phase>package</phase>
@@ -82,18 +70,33 @@
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
                             <minimizeJar>true</minimizeJar>
+
+                            <!-- Shade only your own module -->
                             <artifactSet>
+                                <includes>
+                                    <include>ht.heist:core-java</include>
+                                </includes>
                                 <excludes>
                                     <exclude>net.runelite:client</exclude>
                                     <exclude>net.runelite:runelite-api</exclude>
+                                    <exclude>javax.inject:javax.inject</exclude>
                                 </excludes>
                             </artifactSet>
-                            <transformers>
-                                <!-- Keep plugin.properties at jar root for RL discovery -->
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
-                                    <resource>plugin.properties</resource>
-                                </transformer>
-                            </transformers>
+
+                            <!-- Strip signatures & multi-release/module descriptors -->
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/versions/**</exclude>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>META-INF/*.module</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                         </configuration>
                     </execution>
                 </executions>

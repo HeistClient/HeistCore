@@ -1,27 +1,57 @@
 // ============================================================================
 // FILE: MouseGateway.java
+// PATH: core-rl/src/main/java/ht/heist/corerl/input/MouseGateway.java
 // PACKAGE: ht.heist.corerl.input
 // -----------------------------------------------------------------------------
 // TITLE
-//   MouseGateway — the *thin* AWT dispatcher that talks to RuneLite's Canvas.
+//   MouseGateway — Thin AWT dispatcher that talks to RuneLite's Canvas
 //
-// WHAT IT DOES
+// WHAT THIS CLASS IS
+//   • A minimal, **stateless** bridge that turns higher-level intents
+//     (move, click, hold, shift modifiers) into **synthetic AWT events**
+//     targeting RuneLite's game Canvas.
+//
+// WHAT THIS CLASS DOES (intentionally simple)
 //   • moveAlong(path, stepMinMs, stepMaxMs):
-//       Dispatches a sequence of MOUSE_MOVED events with small sleeps between
-//       points. Timings come from HumanMouse.
+//       - Iterates a list of canvas Points
+//       - Dispatches a MOUSE_MOVED event for each point
+//       - Sleeps a small randomized delay between points (pacing supplied
+//         by the caller; here we only sample uniformly)
 //   • clickAt(point, holdMinMs, holdMaxMs, shiftAlreadyDown):
-//       Press → hold → release at the given point. Hold duration is sampled
-//       uniformly in [min..max]. If shiftAlreadyDown is true, the press is
-//       sent with SHIFT_DOWN_MASK (HumanMouse manages Shift waits).
+//       - Emits a PRESS → (sleep hold) → RELEASE → CLICKED sequence at `point`
+//       - If `shiftAlreadyDown` is true, it sets the SHIFT modifier mask
+//         on the events (HumanMouse controls *when* Shift is down).
 //   • shiftDown() / shiftUp():
-//       Presses/releases Shift on the Canvas. HumanMouse controls *when* to
-//       call these and how long to wait around them.
+//       - Sends KEY_PRESSED / KEY_RELEASED for VK_SHIFT to the Canvas.
+//       - Timing is **not** handled here (HumanMouse sleeps around these).
+//   • (NEW) canvasOrNull():
+//       - Exposes the actual Canvas the client is currently using, or null
+//         if not available (e.g., not logged in yet)
+//   • (NEW) dispatchMove(Point):
+//       - Dispatches a single MOUSE_MOVED (no sleep). HumanMouse uses this to
+//         implement its own "ease-in" pacing logic across the path.
 //
-// DESIGN NOTES
-//   • No “humanization” lives here — this class just performs exactly what it’s
-//     told. Curves, reaction, Gaussian, overshoots, etc. are handled by HumanMouse.
-//   • All sleeps are in the calling thread; HumanMouse runs them on its own
-//     single-thread executor so the game thread isn’t blocked.
+// WHAT THIS CLASS DOES **NOT** DO
+//   • No "humanization": no curves, no timing profiles, no overshoots.
+//     All of that lives in HumanMouse/Humanizer so you have **one** place
+//     to tune the "feel".
+//   • No Background Threads: all sleeps occur **in the caller thread**.
+//     HumanMouse already runs on its own single-threaded executor.
+//
+// THREADING & SAFETY
+//   • Canvas access is read-only and null-checked each time.
+//   • All AWT events are synchronously dispatched to the Canvas via
+//     Canvas.dispatchEvent(...). RuneLite is built to tolerate this for
+//     synthetic input; we keep it **light** and **deterministic** here.
+//
+// COORDINATE SYSTEM
+//   • All Points are expected to be **canvas coordinates** (pixels) in the
+//     current RuneLite client window. Make sure upstream code computes them
+//     appropriately when targeting UI or game objects.
+//
+// LOGGING
+//   • SLF4J logger is present but used sparingly to avoid hot-path overhead.
+//     Most diagnostics should be handled at the controller layer.
 // ============================================================================
 
 package ht.heist.corerl.input;
@@ -43,9 +73,15 @@ import java.util.concurrent.ThreadLocalRandom;
 @Singleton
 public class MouseGateway
 {
+    /** SLF4J logger; avoid heavy logging inside hot paths. */
     private static final Logger log = LoggerFactory.getLogger(MouseGateway.class);
 
+    /** RuneLite client (provides access to the active Canvas). */
     private final Client client;
+
+    // -------------------------------------------------------------------------
+    // CONSTRUCTION
+    // -------------------------------------------------------------------------
 
     @Inject
     public MouseGateway(Client client)
@@ -54,8 +90,61 @@ public class MouseGateway
     }
 
     // -------------------------------------------------------------------------
+    // CANVAS HELPERS (SAFE ACCESS)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Return the current RuneLite Canvas or null if none is available.
+     *
+     * WHY THIS EXISTS
+     *  - Higher layers may want to check availability once per sequence
+     *    and skip actions if the canvas has not been created yet, or if
+     *    the client is transitioning states.
+     */
+    public Canvas canvasOrNull() {
+        return client.getCanvas();
+    }
+
+    /**
+     * Dispatch a single MOUSE_MOVED event at the given canvas point.
+     *
+     * NOTES
+     *  - No sleeping is performed here (HumanMouse controls pacing).
+     *  - Null-safe: if canvas or point is null, this is a no-op.
+     */
+    public void dispatchMove(Point p) {
+        final Canvas canvas = client.getCanvas();
+        if (canvas == null || p == null) return;
+
+        // Synthesize a standard "mouse moved" event with no modifiers.
+        canvas.dispatchEvent(new MouseEvent(
+                canvas,
+                MouseEvent.MOUSE_MOVED,
+                System.currentTimeMillis(),
+                0,                      // no modifiers
+                p.x, p.y,
+                0,                      // clickCount
+                false,                  // popupTrigger
+                0                       // button (unused for move)
+        ));
+    }
+
+    // -------------------------------------------------------------------------
     // MOVE: dispatch a series of MOUSE_MOVED events along the provided path
     // -------------------------------------------------------------------------
+
+    /**
+     * Moves the mouse along a precomputed path by dispatching a sequence of
+     * MOUSE_MOVED events and sleeping between points.
+     *
+     * @param path      ordered list of canvas Points; if empty or null → no-op
+     * @param stepMinMs minimum sleep between points (inclusive)
+     * @param stepMaxMs maximum sleep between points (inclusive)
+     *
+     * THREADING
+     *  - Sleeps in the **calling thread**. HumanMouse calls this from its
+     *    dedicated single-threaded executor to avoid blocking the game thread.
+     */
     public void moveAlong(List<Point> path, int stepMinMs, int stepMaxMs) throws InterruptedException
     {
         if (path == null || path.isEmpty()) return;
@@ -64,37 +153,46 @@ public class MouseGateway
 
         for (Point p : path)
         {
-            // MOUSE_MOVED
-            canvas.dispatchEvent(new MouseEvent(
-                    canvas,
-                    MouseEvent.MOUSE_MOVED,
-                    System.currentTimeMillis(),
-                    0,                      // no modifiers
-                    p.x, p.y,
-                    0,                      // clickCount
-                    false,                  // popupTrigger
-                    0                       // button
-            ));
+            // Use the helper so single-point logic stays in one place.
+            dispatchMove(p);
 
-            // step pacing
-            int d = uniform(stepMinMs, stepMaxMs);
+            // Pacing: uniform random in [min..max] (caller chooses the range).
+            final int d = uniform(stepMinMs, stepMaxMs);
             if (d > 0) Thread.sleep(d);
         }
     }
 
     // -------------------------------------------------------------------------
-    // CLICK: PRESS (hold) RELEASE at a point
+    // CLICK: PRESS (hold) RELEASE at a point (LEFT BUTTON by design)
     // -------------------------------------------------------------------------
+
+    /**
+     * Emits a PRESS → HOLD → RELEASE → CLICKED sequence at the given point.
+     *
+     * @param at               canvas coordinate where the click occurs
+     * @param holdMinMs        minimum hold duration (inclusive)
+     * @param holdMaxMs        maximum hold duration (inclusive)
+     * @param shiftAlreadyDown if true, the SHIFT modifier mask is set on the
+     *                         events (HumanMouse decides timing of Shift key)
+     *
+     * BEHAVIOR
+     *  - Uses BUTTON1 (left button) only. If you ever need right-click support,
+     *    consider adding a separate method (to avoid changing existing call sites).
+     *  - The CLICKED synthetic event is sent because some UI paths expect it.
+     *
+     * THREADING
+     *  - Sleeps in the **calling thread** (during the "hold" interval).
+     */
     public void clickAt(Point at, int holdMinMs, int holdMaxMs, boolean shiftAlreadyDown) throws InterruptedException
     {
         if (at == null) return;
         final Canvas canvas = client.getCanvas();
         if (canvas == null) return;
 
-        // modifiers for press/release
+        // Modifiers observed by the PRESS/RELEASE pair
         final int baseMods = shiftAlreadyDown ? InputEvent.SHIFT_DOWN_MASK : 0;
 
-        // PRESS (with left button mask)
+        // PRESS (button1 down)
         canvas.dispatchEvent(new MouseEvent(
                 canvas,
                 MouseEvent.MOUSE_PRESSED,
@@ -106,11 +204,11 @@ public class MouseGateway
                 MouseEvent.BUTTON1
         ));
 
-        // HOLD for human-like duration (HumanMouse decided the range)
-        int hold = uniform(holdMinMs, holdMaxMs);
+        // HOLD for a human-like duration (range supplied by HumanMouse/Humanizer)
+        final int hold = uniform(holdMinMs, holdMaxMs);
         if (hold > 0) Thread.sleep(hold);
 
-        // RELEASE
+        // RELEASE (button1 up)
         canvas.dispatchEvent(new MouseEvent(
                 canvas,
                 MouseEvent.MOUSE_RELEASED,
@@ -122,7 +220,7 @@ public class MouseGateway
                 MouseEvent.BUTTON1
         ));
 
-        // Optional: emit a CLICKED event, some UIs expect it.
+        // CLICKED (optional; some UI listeners rely on this consolidated event)
         canvas.dispatchEvent(new MouseEvent(
                 canvas,
                 MouseEvent.MOUSE_CLICKED,
@@ -136,8 +234,16 @@ public class MouseGateway
     }
 
     // -------------------------------------------------------------------------
-    // SHIFT MODIFIER: down / up (timing handled by HumanMouse)
+    // SHIFT MODIFIER: key down / key up (timing is handled by HumanMouse)
     // -------------------------------------------------------------------------
+
+    /**
+     * Sends KEY_PRESSED for VK_SHIFT to the canvas.
+     *
+     * NOTE
+     *  - This does **not** sleep; HumanMouse is responsible for adding
+     *    pre/post delays around Shift (keyLeadMs/keyLagMs).
+     */
     public void shiftDown()
     {
         final Canvas canvas = client.getCanvas();
@@ -153,6 +259,9 @@ public class MouseGateway
         ));
     }
 
+    /**
+     * Sends KEY_RELEASED for VK_SHIFT to the canvas.
+     */
     public void shiftUp()
     {
         final Canvas canvas = client.getCanvas();
@@ -169,12 +278,20 @@ public class MouseGateway
     }
 
     // -------------------------------------------------------------------------
-    // helpers
+    // SMALL UTILS
     // -------------------------------------------------------------------------
+
+    /**
+     * Uniform integer sample in [min..max], inclusive.
+     * If both are ≤ 0, return 0 to avoid negative sleeps.
+     * If min > max, the bounds are swapped.
+     */
     private static int uniform(int min, int max)
     {
         if (max < min) { int t = min; min = max; max = t; }
         if (min <= 0 && max <= 0) return 0;
-        return ThreadLocalRandom.current().nextInt(Math.max(0, min), Math.max(0, max) + 1);
+        final int lo = Math.max(0, min);
+        final int hi = Math.max(0, max);
+        return ThreadLocalRandom.current().nextInt(lo, hi + 1);
     }
 }
