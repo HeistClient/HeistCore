@@ -4,34 +4,46 @@
 // PACKAGE: ht.heist.plugins.woodcutter
 // -----------------------------------------------------------------------------
 // TITLE
-//   Heist Woodcutter (Thin, Unified Feel, With Session Reset + Idle/Fatigue)
-//
-// WHAT THIS FILE ADDS
-//   • Calls humanizer.onSessionStart() at plugin start (resets drift each run).
-//   • Uses IdleController to occasionally pause + gradually increase fatigue.
-//   • Adds a simple "LoS" check via CameraService before clicking trees.
-//   • Wraps risky sections with structured logs (HeistLog.diag) + guardrails.
+//   Heist Woodcutter (Thin, Unified Feel)
 // -----------------------------------------------------------------------------
+// WHAT THIS FILE DOES (IN PLAIN ENGLISH)
+//   • Keeps the plugin "thin": it asks for clicks; the core decides *how*.
+//   • Delegates all humanization (curvature, drift, speed, holds) to core-java.
+//   • Adds small human-ish idles using IdleController (no direct fatigue knob).
+//   • Performs a simple visibility (LoS) gate via CameraService before clicking.
+//   • Logs important milestones with structured diagnostics for easy triage.
+// -----------------------------------------------------------------------------
+// DESIGN NOTES
+//   • NO direct calls to humanizer.* — HumanMouse encapsulates feel internally.
+//   • If you later want explicit APIs (e.g., startSession(), setFatigue(...)),
+//     expose tiny methods on HumanMouse that forward to core-java safely.
+//   • Misclicks/overshoot/ease-in should live inside the planner used by
+//     HumanMouse. The plugin remains declarative: "click this hull/rect".
+// ============================================================================
+
 package ht.heist.plugins.woodcutter;
 
 import com.google.inject.Provides;
+
+import ht.heist.corejava.logging.HeistLog;
 import ht.heist.corerl.input.CameraService;
 import ht.heist.corerl.input.HumanMouse;
 import ht.heist.corerl.input.IdleController;
 import ht.heist.corerl.object.TreeDetector;
 import ht.heist.corerl.object.TreeType;
 import ht.heist.plugins.woodcutter.io.SyntheticTapLogger;
-import ht.heist.corejava.logging.HeistLog;
-import org.slf4j.Logger;
 
 import net.runelite.api.*;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetInfo;
+
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+
+import org.slf4j.Logger;
 
 import javax.inject.Inject;
 import java.awt.Shape;
@@ -46,112 +58,149 @@ import java.util.Random;
 )
 public class WoodcutterPlugin extends Plugin
 {
-    // ---- Logger (SLF4J) -----------------------------------------------------
+    // -------------------------------------------------------------------------
+    // LOGGING
+    // -------------------------------------------------------------------------
+    // HeistLog.get(...) returns an org.slf4j.Logger wired to your logging backend.
     private static final Logger log = HeistLog.get(WoodcutterPlugin.class);
 
-    // ---- Injected deps -------------------------------------------------------
-    @Inject private Client client;
-    @Inject private WoodcutterConfig config;
-    @Inject private HumanMouse humanMouse;                    // unified feel
-    @Inject private SyntheticTapLogger syntheticTapLogger;    // JSONL writer (HUD tails this)
-    @Inject private IdleController idleController;            // small idle + fatigue drift
-    @Inject private CameraService cameraService;              // simple LoS check (expand later)
+    // -------------------------------------------------------------------------
+    // INJECTED SERVICES
+    // -------------------------------------------------------------------------
+    @Inject private Client client;                       // RuneLite client handle (game state, widgets, player)
+    @Inject private WoodcutterConfig config;             // Plugin configuration (tree type etc.)
+    @Inject private HumanMouse humanMouse;               // Unified mouse executor (curves, timing, overshoot)
+    @Inject private SyntheticTapLogger syntheticTapLogger; // Writes JSONL taps (HUD tails this)
+    @Inject private IdleController idleController;       // Adds small idle moments to feel human
+    @Inject private CameraService cameraService;         // Basic line-of-sight / visibility checks
 
-    // ---- State ---------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // PLUGIN STATE
+    // -------------------------------------------------------------------------
     private enum State { STARTING, FINDING_TREE, VERIFYING, CHOPPING, INVENTORY }
     private State state = State.STARTING;
-    private long  wakeAt = 0L;
 
+    /** A simple time gate (epoch millis) used to back off between actions. */
+    private long wakeAt = 0L;
+
+    /** The current target tree (if any). */
     private GameObject targetTree = null;
+
+    /** Local RNG for small randomized backoffs. */
     private final Random rng = new Random();
 
-    // ---- Config provider (RuneLite standard) --------------------------------
+    // -------------------------------------------------------------------------
+    // CONFIG PROVIDER (RuneLite standard)
+    // -------------------------------------------------------------------------
     @Provides
-    WoodcutterConfig provideConfig(ConfigManager cm) {
+    WoodcutterConfig provideConfig(ConfigManager cm)
+    {
         return cm.getConfig(WoodcutterConfig.class);
     }
 
-    // ------------------------------------------------------------------------
-    // LIFECYCLE
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // LIFECYCLE: startUp / shutDown
+    // -------------------------------------------------------------------------
     @Override
     protected void startUp()
     {
-        // (A) Wire the synthetic tap sink → JSONL (HUD will tail that file)
+        // (1) Wire the "tap sink" so each synthetic click is mirrored to JSONL.
+        //     The HUD plugin can tail this file and render your clicks.
+        //     NOTE: humanMouse handles null-sinks gracefully; we supply one here.
         humanMouse.setTapSink(p -> {
-            try { syntheticTapLogger.log(p.x, p.y); } catch (Throwable ignored) {}
+            try {
+                // p.x/p.y are canvas-space target coords for the click.
+                syntheticTapLogger.log(p.x, p.y);
+            } catch (Throwable ignored) {
+                // We keep this sink fire-and-forget; logging failures shouldn't
+                // break gameplay. JSONL is nice-to-have telemetry.
+            }
         });
 
-        // (B) RESET SESSION FEEL:
-        //     This zeros the tiny AR(1) drift and resets fatigue to 0 so that
-        //     each plugin run starts fresh. THIS is the "session reset" wiring.
-        humanMouse.getHumanizer().onSessionStart();
-
-        // (C) Optional: you can set an initial fatigue if desired (0..1)
-        // humanMouse.getHumanizer().setFatigueLevel(0.0);
+        // (2) We do NOT call humanMouse.getHumanizer() or onSessionStart().
+        //     The "unified feel" inside core-java initializes its own session/
+        //     drift state. If you later expose HumanMouse.startSession(), we
+        //     could call it here. For now: zero extra wiring needed.
 
         state = State.FINDING_TREE;
         HeistLog.diag(log, "woodcutter_start");
+        log.info("Heist Woodcutter started");
     }
 
     @Override
     protected void shutDown()
     {
+        // Reset local state. HumanMouse / core-java doesn't require explicit
+        // cleanup for feel; it’s stateless across plugin shutdowns by design.
         state = State.STARTING;
+        targetTree = null;
+        wakeAt = 0L;
+
         HeistLog.diag(log, "woodcutter_stop");
+        log.info("Heist Woodcutter stopped");
     }
 
-    // ------------------------------------------------------------------------
-    // TICK LOOP
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // MAIN LOOP: runs once per GameTick (~600ms)
+    // -------------------------------------------------------------------------
     @Subscribe
     public void onGameTick(GameTick tick)
     {
-        // (D) Respect any "wakeAt" gate to avoid burning CPU or spamming actions
-        if (System.currentTimeMillis() < wakeAt) return;
+        // (A) Backoff gate: if we recently acted, skip this tick.
+        if (System.currentTimeMillis() < wakeAt)
+            return;
 
         final Player me = client.getLocalPlayer();
-        if (client.getGameState() != GameState.LOGGED_IN || me == null) return;
+        if (client.getGameState() != GameState.LOGGED_IN || me == null)
+            return;
 
-        // (E) OCCASIONAL HUMAN-LIKE IDLE + FATIGUE DRIFT
-        //     This is *optional* but adds realism; tweak IdleController to taste.
-        try {
-            long idleMs = idleController.maybeIdle();
-            if (idleMs > 0) Thread.sleep(idleMs);
-            // Gradually increase fatigue (affects reaction mean slightly)
-            double f = idleController.nextFatigue(humanMouse.getHumanizer().fatigueLevel());
-            humanMouse.getHumanizer().setFatigueLevel(f);
-        } catch (InterruptedException ignored) {}
+        // (B) Optional micro-idle: IdleController decides if we should pause
+        //     slightly to look less robotic. This *does not* modify humanizer
+        //     internals — the unified feel is self-contained in core-java.
+        try
+        {
+            long idleMs = idleController.maybeIdle(); // small stochastic pause
+            if (idleMs > 0)
+                Thread.sleep(idleMs);
+        }
+        catch (InterruptedException ignored) {}
 
-        try {
+        try
+        {
             switch (state)
             {
                 case STARTING:
                 case FINDING_TREE:
                 {
+                    // (C) Acquire a target of the desired type.
                     final TreeType want = config.treeType();
                     targetTree = TreeDetector.findNearest(client, want);
 
                     if (targetTree == null)
                     {
-                        // nothing in view; idle lightly and retry
-                        wakeAt = System.currentTimeMillis() + 400 + rng.nextInt(400);
+                        // Nothing found in view; short randomized backoff then retry.
+                        wakeAt = System.currentTimeMillis() + 350 + rng.nextInt(450);
+                        HeistLog.diag(log, "no_tree_found_retry");
                         break;
                     }
 
-                    // (F) Simple visibility gate: if not visible, nudge the camera (future work)
-                    if (!cameraService.isVisible(targetTree)) {
-                        // TODO: cameraService.face(targetTree) with small key/drag steps
-                        // For now, just back off a bit and retry; avoids blind clicking.
+                    // (D) Simple LoS gate. If not visible, avoid blind clicks and
+                    //     let CameraService rotate/adjust in future iterations.
+                    if (!cameraService.isVisible(targetTree))
+                    {
                         HeistLog.diag(log, "tree_not_visible_retrying");
+                        // TODO (future): cameraService.face(targetTree)
                         wakeAt = System.currentTimeMillis() + 280 + rng.nextInt(220);
                         break;
                     }
 
-                    // (G) Delegate the entire click to HumanMouse (curved → reaction → press)
+                    // (E) Delegate the *entire* click execution to HumanMouse.
+                    //     Inside, it will: generate a curved path, apply drift,
+                    //     overshoot (if enabled), apply deceleration near target,
+                    //     sample reaction/hold times, and dispatch events.
                     clickGameObjectHull(targetTree);
 
-                    // Allow the worker to run a bit, then verify via animation
+                    // (F) Move to VERIFYING, give the worker time to start.
                     state = State.VERIFYING;
                     wakeAt = System.currentTimeMillis() + 900 + rng.nextInt(300);
                     break;
@@ -159,13 +208,15 @@ public class WoodcutterPlugin extends Plugin
 
                 case VERIFYING:
                 {
+                    // (G) If our player is playing the axe animation, we’re chopping.
                     if (me.getAnimation() == currentAxeAnim())
                     {
                         state = State.CHOPPING;
+                        HeistLog.diag(log, "chop_started");
                     }
                     else
                     {
-                        // not animating and idle → try again
+                        // If idle (pose anim == idle pose) we likely missed; try again.
                         if (me.getPoseAnimation() == me.getIdlePoseAnimation())
                             state = State.FINDING_TREE;
                     }
@@ -174,103 +225,144 @@ public class WoodcutterPlugin extends Plugin
 
                 case CHOPPING:
                 {
+                    // (H) If the chop animation stops, the tree despawned or chop ended.
                     if (me.getAnimation() != currentAxeAnim())
                     {
-                        // chop ended/despawned
                         state = State.FINDING_TREE;
                     }
-                    // inventory full? go drop
+
+                    // (I) Inventory management: if full, go drop logs.
                     if (isInventoryFull())
                     {
                         state = State.INVENTORY;
+                        HeistLog.diag(log, "inventory_full");
                     }
                     break;
                 }
 
                 case INVENTORY:
                 {
-                    // Shift-drop one log per loop; HumanMouse handles Shift timing internally
+                    // (J) Shift-drop one log per pass. HumanMouse manages shift timing.
                     if (!dropOneLogIfPresent())
                     {
-                        // nothing left to drop; resume cutting
+                        // No logs left; resume chopping.
                         state = State.FINDING_TREE;
+                        HeistLog.diag(log, "inventory_cleared");
                     }
-                    // brief human pause between drops
+
+                    // Human-like short pause between drops.
                     wakeAt = System.currentTimeMillis() + 180 + rng.nextInt(120);
                     break;
                 }
             }
-        } catch (Throwable t) {
-            // (H) GUARDRails + structured log line for fast triage
+        }
+        catch (Throwable t)
+        {
+            // (K) Guardrails: one-line diagnostic + full stack (warn) for triage.
             HeistLog.diag(log, "tick_error", "reason", t.getClass().getSimpleName());
             log.warn("Woodcutter tick error (continuing)", t);
-            // small backoff to avoid tight error loops
+
+            // Small backoff avoids tight error loops.
             wakeAt = System.currentTimeMillis() + 250;
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Thin click helper (delegates to HumanMouse)
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // CLICK HELPERS (thin delegations to HumanMouse)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Clicks anywhere inside a GameObject's convex hull.
+     * HumanMouse will compute a believable approach path and timings.
+     */
     private void clickGameObjectHull(GameObject obj)
     {
-        if (obj == null) return;
-        final Shape hull = obj.getConvexHull();
-        if (hull == null) return;
+        if (obj == null)
+            return;
 
-        humanMouse.clickHull(hull, /*shift=*/false);
+        final Shape hull = obj.getConvexHull();
+        if (hull == null)
+            return;
+
+        // shift=false for regular interactions.
+        humanMouse.clickHull(hull, /* shift = */ false);
     }
 
-    // ------------------------------------------------------------------------
-    // Inventory helpers (Shift-drop)
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // INVENTORY HELPERS (Shift-drop logs)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Attempts to shift-drop a single log stack in the inventory.
+     * @return true if a log was found and clicked; false otherwise.
+     */
     private boolean dropOneLogIfPresent()
     {
         final Widget inv = client.getWidget(WidgetInfo.INVENTORY);
-        if (inv == null || inv.isHidden()) return false;
+        if (inv == null || inv.isHidden())
+            return false;
 
         final List<Integer> logIds = Arrays.asList(
                 ItemID.LOGS, ItemID.OAK_LOGS, ItemID.WILLOW_LOGS, ItemID.MAPLE_LOGS,
                 ItemID.TEAK_LOGS, ItemID.MAHOGANY_LOGS, ItemID.YEW_LOGS, ItemID.MAGIC_LOGS
         );
 
+        // Iterate visible inventory children; click the first log stack found.
         for (Widget w : inv.getDynamicChildren())
         {
-            if (w == null) continue;
+            if (w == null)
+                continue;
+
             if (logIds.contains(w.getItemId()))
             {
-                // Shift-drop this slot via HumanMouse (curved → react → press with Shift)
-                humanMouse.clickRect(w.getBounds(), /*shift=*/true);
+                // Shift-click a rectangle (widget bounds). HumanMouse will:
+                //  • choose an interior point (or a small jitter),
+                //  • approach with a human-ish path,
+                //  • press with shift modifier using realistic hold timing.
+                humanMouse.clickRect(w.getBounds(), /* shift = */ true);
+                HeistLog.diag(log, "drop_log_click", "itemId", w.getItemId());
                 return true;
             }
         }
+
         return false;
     }
 
+    /** @return true if the inventory is full (>= 28 items). */
     private boolean isInventoryFull()
     {
         final ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
         return inv != null && inv.count() >= 28;
     }
 
-    // ------------------------------------------------------------------------
-    // Axe animation lookup (unchanged)
-    // ------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // ANIMATION LOOKUP
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns the expected woodcutting animation id for the currently equipped axe.
+     * If the weapon is unknown or absent, returns -1.
+     */
     private int currentAxeAnim()
     {
         final ItemContainer eq = client.getItemContainer(InventoryID.EQUIPMENT);
-        if (eq == null) return -1;
+        if (eq == null)
+            return -1;
+
         final Item weapon = eq.getItem(EquipmentInventorySlot.WEAPON.getSlotIdx());
-        if (weapon == null) return -1;
+        if (weapon == null)
+            return -1;
 
         switch (weapon.getId())
         {
-            case ItemID.BRONZE_AXE:  return AnimationID.WOODCUTTING_BRONZE;
-            case ItemID.IRON_AXE:    return AnimationID.WOODCUTTING_IRON;
-            case ItemID.STEEL_AXE:   return AnimationID.WOODCUTTING_STEEL;
-            case ItemID.MITHRIL_AXE: return AnimationID.WOODCUTTING_MITHRIL;
-            case ItemID.ADAMANT_AXE: return AnimationID.WOODCUTTING_ADAMANT;
-            case ItemID.RUNE_AXE:    return AnimationID.WOODCUTTING_RUNE;
+            case ItemID.BRONZE_AXE:   return AnimationID.WOODCUTTING_BRONZE;
+            case ItemID.IRON_AXE:     return AnimationID.WOODCUTTING_IRON;
+            case ItemID.STEEL_AXE:    return AnimationID.WOODCUTTING_STEEL;
+            case ItemID.MITHRIL_AXE:  return AnimationID.WOODCUTTING_MITHRIL;
+            case ItemID.ADAMANT_AXE:  return AnimationID.WOODCUTTING_ADAMANT;
+            case ItemID.RUNE_AXE:     return AnimationID.WOODCUTTING_RUNE;
+            // Extend for dragon/infernal/3A if desired:
+            // case ItemID.DRAGON_AXE:  return AnimationID.WOODCUTTING_DRAGON;
             default: return -1;
         }
     }

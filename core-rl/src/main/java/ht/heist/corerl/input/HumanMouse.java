@@ -4,44 +4,107 @@
 // PACKAGE: ht.heist.corerl.input
 // -----------------------------------------------------------------------------
 // TITLE
-//   HumanMouse — Unified "human feel" executor (curved move → reaction → click)
-// -----------------------------------------------------------------------------
+//   HumanMouse — unified "humanized click" executor for RuneLite Canvas
+//
+// OVERVIEW
+//   This class performs a complete human-like click sequence by asking the
+//   PURE-JAVA core for *all* "feel":
+//     • WHERE to move and *how*: via MouseService.planPath(...) -> MousePlan
+//     • WHEN to pause and press: via MouseService.planTimings() -> Timings
+//
+//   HumanMouse itself does *no* humanization math. It simply:
+//     1) Asks MouseService to choose a target point in a shape/rect (if needed).
+//     2) Asks MouseService to plan a curved path and per-move step pacing.
+//     3) Dispatches MOUSE_MOVED events along that path using MouseGateway.
+//     4) Sleeps a Gaussian "reaction" BEFORE pressing (from Timings).
+//     5) Optionally handles Shift modifier (tiny fixed waits — see notes).
+//     6) Delegates PRESS/HOLD/RELEASE to MouseGateway.clickAt(...).
+//
+//   RESULT
+//     • You can tune all humanization (drift, curvature, wobble, timing)
+//       centrally in core-java (Humanizer/HumanizerImpl/MouseServiceImpl).
+//     • core-rl stays thin and focused on RuneLite I/O only.
+//
+// DEPENDENCIES
+//   - ht.heist.corejava.api.input.MouseService (core-java API; pure Java)
+//   - ht.heist.corejava.input.MouseServiceImpl (default implementation)
+//   - MouseGateway (this module; dispatches AWT events to RuneLite Canvas)
+//
+// THREADING
+//   - Uses a single-threaded executor so plugin code never blocks the game
+//     thread. Each click request is submitted as a task to that worker.
+// ============================================================================
+
 package ht.heist.corerl.input;
 
-import ht.heist.corejava.api.input.Humanizer;
-import ht.heist.corejava.input.HumanizerImpl;
-import ht.heist.corejava.logging.HeistLog;
-
-import org.slf4j.Logger;  // <-- IMPORTANT: SLF4J (not java.util)
+import ht.heist.corejava.api.input.MouseService;
+import ht.heist.corejava.input.MouseServiceImpl;
+import net.runelite.api.Client;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import java.awt.Canvas;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.Shape;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Consumer;
 
 @Singleton
-public class HumanMouse
+public final class HumanMouse
 {
-    private static final Logger log = HeistLog.get(HumanMouse.class);
+    // -------------------------------------------------------------------------
+    // Logger (for diagnostics and guardrails)
+    // -------------------------------------------------------------------------
+    private static final Logger log = LoggerFactory.getLogger(HumanMouse.class);
 
+    // -------------------------------------------------------------------------
+    // IO bridge that talks to the RuneLite Canvas (dispatches AWT events)
+    // -------------------------------------------------------------------------
     private final MouseGateway io;
-    private final Humanizer humanizer;
+
+    // -------------------------------------------------------------------------
+    // Pure-Java planner providing all "feel" (path & timings)
+    //   • This centralizes drift/curvature/wobble/timing in core-java.
+    // -------------------------------------------------------------------------
+    private final MouseService mouse;
+
+    // -------------------------------------------------------------------------
+    // Worker so we do not block the game thread while sleeping/moving/clicking
+    // -------------------------------------------------------------------------
     private final ExecutorService exec;
 
+    // -------------------------------------------------------------------------
+    // Optional: tap sink callback (e.g., JSONL logger or HUD listener)
+    // Called right before we press the mouse button at the final target.
+    // -------------------------------------------------------------------------
     private volatile Consumer<Point> tapSink = null;
+
+    // -------------------------------------------------------------------------
+    // State: we remember the last target used so consecutive moves feel smooth
+    // -------------------------------------------------------------------------
     private volatile Point lastMouse = null;
 
+    // rng used only for small internal choices (e.g., rare fallbacks)
+    private final Random rng = new Random();
+
+    // -------------------------------------------------------------------------
+    // CONSTRUCTION
+    //   • We inject MouseGateway from DI (RuneLite provides Client).
+    //   • We internally construct MouseServiceImpl (pure Java).
+    //     If you later want to inject MouseService as well, that's fine.
+    // -------------------------------------------------------------------------
     @Inject
     public HumanMouse(MouseGateway io)
     {
         this.io = io;
-        this.humanizer = new HumanizerImpl();
+        this.mouse = new MouseServiceImpl(); // centralizes "feel"
         this.exec = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "Heist-HumanMouse");
             t.setDaemon(true);
@@ -49,213 +112,214 @@ public class HumanMouse
         });
     }
 
-    /** Click inside a polygonal hull with human-like motion + reaction. */
+    // =========================================================================
+    // PUBLIC API — High-level click helpers
+    // =========================================================================
+
+    /**
+     * Title: Click inside an arbitrary shape (e.g., convex hull of a GameObject).
+     * Behavior: Delegates the sampling of a human-like point-in-shape to the
+     *           MouseService (which applies sticky drift / elliptical Gaussian),
+     *           plans a path, performs a human-like reaction delay, and clicks.
+     *
+     * @param hull  shape to click inside (e.g., GameObject.getConvexHull()).
+     * @param shift if true, we hold Shift around the click.
+     */
     public void clickHull(Shape hull, boolean shift)
     {
         if (hull == null) return;
-        Rectangle b = hull.getBounds();
-        Point target = pickPointInShapeGaussian(hull);
+
+        // Ask the pure-Java core to pick a point inside the shape (humanized).
+        final Point target = mouse.pickPointInShape(hull);
         submitMoveReactClick(target, shift);
-        HeistLog.diag(log, "clickHull", "x", target.x, "y", target.y, "w", b.width, "h", b.height);
     }
 
-    /** Click inside a rectangle (widgets, inventory slots, minimap). */
+    /**
+     * Title: Click inside a rectangle (e.g., inventory slot bounds).
+     * Delegates point picking to MouseService for humanized sampling.
+     */
     public void clickRect(Rectangle rect, boolean shift)
     {
         if (rect == null) return;
-        final int cx = (int)Math.round(rect.getCenterX());
-        final int cy = (int)Math.round(rect.getCenterY());
-        Point target = new Point(
-                clampGaussianWithin(cx, rect.x, rect.x + rect.width  - 1, rect.width  / 4.0),
-                clampGaussianWithin(cy, rect.y, rect.y + rect.height - 1, rect.height / 4.0)
-        );
+
+        final Point target = mouse.pickPointInShape(rect); // rect is a Shape
         submitMoveReactClick(target, shift);
-        HeistLog.diag(log, "clickRect", "x", target.x, "y", target.y, "w", rect.width, "h", rect.height);
     }
 
-    /** Click exactly at a canvas point. */
+    /**
+     * Title: Click a specific canvas point "as human".
+     * If you already have a precise target, we won't re-sample inside a shape.
+     */
     public void clickPoint(Point target, boolean shift)
     {
         if (target == null) return;
         submitMoveReactClick(target, shift);
-        HeistLog.diag(log, "clickPoint", "x", target.x, "y", target.y);
     }
 
+    /**
+     * Title: Tap sink setter (optional).
+     * If set, this callback is invoked right before we press at the target.
+     * Useful for logging heatmaps or building datasets.
+     */
     public void setTapSink(Consumer<Point> sink) { this.tapSink = sink; }
-    public Humanizer getHumanizer() { return humanizer; }
 
-    // -- main sequence (curved move → ease-in → reaction → click) ------------
+    // =========================================================================
+    // INTERNAL — Sequence: move along path -> react -> (optional Shift) click
+    // =========================================================================
+
+    /**
+     * Title: Submit the full "human click" sequence to the worker.
+     * Logic:
+     *   • Build a path via MouseService.planPath(lastMouse, target).
+     *   • Dispatch MOUSE_MOVED along that path with the step delays from plan.
+     *   • Sleep a Gaussian "reaction" time BEFORE press (from planTimings()).
+     *   • If requested: hold Shift around the press with small safety waits.
+     *   • Delegate PRESS/HOLD/RELEASE to MouseGateway.clickAt(...).
+     */
     private void submitMoveReactClick(Point target, boolean shift)
     {
         exec.submit(() -> {
-            try {
+            try
+            {
+                // -----------------------------------------------------------------
+                // 1) PLAN PATH (pure Java) using prior target as "from" if available
+                // -----------------------------------------------------------------
                 final Point from = (lastMouse != null ? lastMouse : target);
-                List<Point> path = planPathLocally(from, target);
+                final MouseService.MousePlan plan = mouse.planPath(from, target);
 
-                if (ThreadLocalRandom.current().nextDouble() < humanizer.overshootProb()) {
-                    Point over = overshootPoint(from, target, humanizer.overshootMaxPx());
-                    path.addAll(planPathLocally(path.isEmpty()? from : path.get(path.size()-1), over));
-                    sleepGaussian(humanizer.correctionPauseMeanMs(), humanizer.correctionPauseStdMs());
-                    path.addAll(planPathLocally(over, target));
+                // The plan provides:
+                //   • path():           List<Point> intermediate waypoints (excludes final target)
+                //   • stepDelayMinMs(): min sleep between move points
+                //   • stepDelayMaxMs(): max sleep between move points
+                final List<Point> waypoints = plan.path();
+                final int stepMinMs = plan.stepDelayMinMs();
+                final int stepMaxMs = plan.stepDelayMaxMs();
+
+                // -----------------------------------------------------------------
+                // 2) MOVE ALONG THE PATH (dispatch MOUSE_MOVED for each waypoint)
+                //     We pace each move with a uniform sleep in [min..max] ms.
+                //     Note: final target is *also* moved to before clicking.
+                // -----------------------------------------------------------------
+                if (waypoints != null && !waypoints.isEmpty())
+                {
+                    for (Point p : waypoints)
+                    {
+                        dispatchMove(p);
+                        sleepMillis(uniform(stepMinMs, stepMaxMs));
+                    }
                 }
 
-                final int stepMin = humanizer.stepMinMs();
-                final int stepMax = humanizer.stepMaxMs();
-                moveWithEaseIn(path, stepMin, stepMax, humanizer.approachEaseIn());
+                // Ensure we end at the final target (so press happens exactly there)
+                dispatchMove(target);
+                sleepMillis(uniform(stepMinMs, stepMaxMs));
 
-                final int reactMean = applyFatigueToMean(
-                        humanizer.reactionMeanMs(), humanizer.fatigueLevel(), 0.25);
-                final int reactStd  = humanizer.reactionStdMs();
-                sleepGaussian(reactMean, reactStd);
+                // -----------------------------------------------------------------
+                // 3) REACTION BEFORE PRESS
+                //    Ask core for human timing ranges (reaction, hold, dwell min/max).
+                //    We only need reaction + hold for this executor.
+                // -----------------------------------------------------------------
+                final MouseService.Timings timings = mouse.planTimings();
 
-                Consumer<Point> sink = this.tapSink;
+                // Reaction: Gaussian around mean/std; clamped to >= 0
+                final int reactMs = gaussianNonNegative(timings.reactMeanMs(), timings.reactStdMs());
+                sleepMillis(reactMs);
+
+                // Tap sink (optional) — e.g., write a heatmap point just before press
+                final Consumer<Point> sink = this.tapSink;
                 if (sink != null) {
                     try { sink.accept(target); } catch (Throwable ignored) {}
                 }
 
-                final int holdMin = humanizer.holdMinMs();
-                final int holdMax = humanizer.holdMaxMs();
-                if (shift) {
+                // -----------------------------------------------------------------
+                // 4) CLICK (optionally with Shift)
+                //    Hold duration is sampled uniformly in [holdMin..holdMax] by gateway.
+                //    For Shift, we add tiny "safety waits" around the click to ensure
+                //    the client registers the modifier; these are intentionally small
+                //    because the centralized timing model doesn't expose keyLead/keyLag
+                //    in Timings. If you later add them, wire them here instead.
+                // -----------------------------------------------------------------
+                final int holdMin = timings.holdMinMs();
+                final int holdMax = timings.holdMaxMs();
+
+                if (shift)
+                {
                     io.shiftDown();
-                    sleepMillis(humanizer.keyLeadMs());
+                    sleepMillis(30); // small lead safety
                     io.clickAt(target, holdMin, holdMax, true);
-                    sleepMillis(humanizer.keyLagMs());
+                    sleepMillis(30); // small lag safety
                     io.shiftUp();
-                } else {
+                }
+                else
+                {
                     io.clickAt(target, holdMin, holdMax, false);
                 }
 
+                // -----------------------------------------------------------------
+                // 5) UPDATE lastMouse for smoother subsequent arcs
+                // -----------------------------------------------------------------
                 lastMouse = target;
-            } catch (InterruptedException ie) {
+            }
+            catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
-            } catch (Throwable e) {
-                HeistLog.diag(log, "humanmouse_error", "reason", e.getClass().getSimpleName());
-                log.warn("HumanMouse sequence error (continuing)", e);
+            }
+            catch (Throwable t) {
+                log.warn("HumanMouse: recoverable error during click sequence", t);
             }
         });
     }
 
-    // -- path planning (Bezier-ish curve + micro wobble) ---------------------
-    private List<Point> planPathLocally(Point from, Point to)
+    // =========================================================================
+    // SMALL HELPERS
+    // =========================================================================
+
+    /**
+     * Title: Dispatch a single MOUSE_MOVED to the current RuneLite Canvas.
+     * Notes:
+     *   - Uses MouseGateway.dispatchMove(...) (no sleep inside).
+     *   - Guarded against null canvas or null point.
+     */
+    private void dispatchMove(Point p)
     {
-        final ArrayList<Point> out = new ArrayList<>();
-        if (to == null) return out;
-        if (from == null) { out.add(new Point(to)); return out; }
-
-        final int dist  = (int)Math.round(from.distance(to));
-        final int steps = clamp(dist / 12, 6, 28);
-
-        final double curvature = humanizer.samplePathCurvature();
-        final double noisePx   = humanizer.pathWobblePx();
-
-        final double dx = to.x - from.x, dy = to.y - from.y;
-        final double len = Math.hypot(dx, dy);
-        final double ux  = (len == 0) ? 0 : (-dy / len);
-        final double uy  = (len == 0) ? 0 : ( dx / len);
-
-        final double side = (ThreadLocalRandom.current().nextBoolean() ? 1.0 : -1.0);
-        final double cx = from.x + dx * 0.5 + side * curvature * 0.25 * len * ux;
-        final double cy = from.y + dy * 0.5 + side * curvature * 0.25 * len * uy;
-
-        for (int i = 1; i <= steps; i++)
-        {
-            final double t  = i / (double)(steps + 1);
-            final double omt= 1.0 - t;
-
-            double bx = omt*omt*from.x + 2.0*omt*t*cx + t*t*to.x;
-            double by = omt*omt*from.y + 2.0*omt*t*cy + t*t*to.y;
-
-            bx += (ThreadLocalRandom.current().nextDouble() * 2 - 1) * noisePx;
-            by += (ThreadLocalRandom.current().nextDouble() * 2 - 1) * noisePx;
-
-            out.add(new Point((int)Math.round(bx), (int)Math.round(by)));
-        }
-        return out;
+        if (p == null) return;
+        final Canvas c = io.canvasOrNull();
+        if (c == null) return;
+        io.dispatchMove(p);
     }
 
-    private Point pickPointInShapeGaussian(Shape shape)
+    /**
+     * Title: Sleep helper that accepts an int (never negative).
+     * The rest of the code casts to int before calling this, which keeps
+     * behavior consistent with Thread.sleep(...) expectations.
+     */
+    private static void sleepMillis(int ms) throws InterruptedException
     {
-        final Rectangle r = shape.getBounds();
-        if (r == null) return new Point(0, 0);
-
-        final double[] bias = humanizer.stepBiasDrift();
-        final double bx = (bias != null && bias.length >= 2) ? bias[0] : 0.0;
-        final double by = (bias != null && bias.length >= 2) ? bias[1] : 0.0;
-
-        final double cx = r.getCenterX(), cy = r.getCenterY();
-        final double sx = Math.max(1.0, r.getWidth()  * 0.32 / 2.0);
-        final double sy = Math.max(1.0, r.getHeight() * 0.36 / 2.0);
-
-        for (int i = 0; i < 10; i++) {
-            final double gx = cx + bx + sx * gauss();
-            final double gy = cy + by + sy * gauss();
-            final int px = (int)Math.round(gx), py = (int)Math.round(gy);
-            if (shape.contains(px, py)) return new Point(px, py);
-        }
-        return new Point((int)cx, (int)cy);
+        if (ms <= 0) return;
+        Thread.sleep(ms);
     }
 
-    /** Move along path with slight slow-down near the end (ease-in). */
-    private void moveWithEaseIn(List<Point> path, int minMs, int maxMs, double easeIn01) throws InterruptedException
+    /**
+     * Title: Inclusive uniform int in [min..max].
+     * Guards against swapped or non-positive ranges.
+     */
+    private static int uniform(int min, int max)
     {
-        if (path == null || path.isEmpty()) return;
-
-        final int n = path.size();
-        for (int i = 0; i < n; i++) {
-            final Point p = path.get(i);
-            io.dispatchMove(p); // helper in MouseGateway (see patch below)
-
-            final double t = (i + 1) / (double) n;
-            final double ease = 1.0 + Math.max(0.0, Math.min(1.0, easeIn01)) * t * t;
-            final int base = uniform(minMs, maxMs);
-            final int d = (int)Math.round(base * ease);
-            if (d > 0) Thread.sleep(d);
-        }
-    }
-
-    private Point overshootPoint(Point from, Point to, double maxPx) {
-        double dx = to.x - from.x, dy = to.y - from.y;
-        double len = Math.hypot(dx, dy);
-        if (len < 1e-6) return new Point(to);
-        double ux = dx / len, uy = dy / len;
-        double m  = ThreadLocalRandom.current().nextDouble(Math.max(1.0, maxPx * 0.35), Math.max(maxPx, 1.0));
-        return new Point((int)Math.round(to.x + ux * m), (int)Math.round(to.y + uy * m));
-    }
-
-    // -- small utils ----------------------------------------------------------
-    private static int uniform(int min, int max) {
         if (max < min) { int t = min; min = max; max = t; }
-        if (min <= 0 && max <= 0) return 0;
-        return ThreadLocalRandom.current().nextInt(Math.max(0, min), Math.max(0, max) + 1);
+        if (max <= 0) return 0;
+        if (min < 0) min = 0;
+        return ThreadLocalRandom.current().nextInt(min, max + 1);
     }
 
-    private static void sleepMillis(int ms) throws InterruptedException {
-        if (ms > 0) Thread.sleep(ms);
-    }
-
-    private static void sleepGaussian(int meanMs, int stdMs) throws InterruptedException {
-        int d = (int)Math.max(0, Math.round(meanMs + gauss() * stdMs));
-        if (d > 0) Thread.sleep(d);
-    }
-
-    private static double gauss() {
-        double u = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
-        double v = Math.max(1e-9, ThreadLocalRandom.current().nextDouble());
-        return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-    }
-
-    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
-
-    private static int clampGaussianWithin(int center, int lo, int hi, double std) {
-        for (int i = 0; i < 6; i++) {
-            int v = (int)Math.round(center + gauss() * std);
-            if (v >= lo && v <= hi) return v;
-        }
-        return Math.max(lo, Math.min(hi, center));
-    }
-
-    private static int applyFatigueToMean(int mean, double fatigue01, double maxPct) {
-        double mult = 1.0 + Math.max(0.0, Math.min(1.0, fatigue01)) * Math.max(0.0, maxPct);
-        return (int)Math.round(mean * mult);
+    /**
+     * Title: Gaussian sample clamped to >= 0.
+     * @param mean mean in ms
+     * @param std  std dev in ms
+     * @return non-negative int milliseconds
+     */
+    private static int gaussianNonNegative(int mean, int std)
+    {
+        if (mean <= 0 && std <= 0) return 0;
+        double g = ThreadLocalRandom.current().nextGaussian(); // mean=0, std=1
+        long v = Math.round(mean + g * std);
+        return (int)Math.max(0, v);
     }
 }
