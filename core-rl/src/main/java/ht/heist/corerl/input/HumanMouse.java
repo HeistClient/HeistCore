@@ -1,32 +1,28 @@
 // ============================================================================
 // FILE: HumanMouse.java
-// PATH: core-rl/src/main/java/ht/heist/corerl/input/HumanMouse.java
 // PACKAGE: ht.heist.corerl.input
 // -----------------------------------------------------------------------------
-// TITLE
-//   HumanMouse — unified "humanized click" executor for RuneLite Canvas
-//
-// WHAT THIS CLASS DOES (mirrors your old working method)
-//   • Delegates ALL "feel" (where to move, how to arc, pacing, timings)
-//     to the pure-Java core (MouseService/MouseServiceImpl).
-//   • Uses MouseGateway to dispatch pure AWT events (no Robot / no OS cursor).
-//   • CRITICAL: path planning **always** starts from the *actual* canvas
-//     pointer (from RuneLite), never from the target → no teleports.
-//   • If RL doesn’t have a pointer yet (very first click), it synthesizes
-//     a tiny pre-approach behind the target so the first move still looks
-//     like a real approach.
-// ============================================================================
+// CHANGES IN THIS VERSION (ALL REQUESTED ENHANCEMENTS)
+//   • Guaranteed pre-press settle: choose target dwell in [dwellMin..dwellMax],
+//     then sleep enough so (lastMove→DOWN) ≥ target dwell (includes keyLead).
+//   • Ease-out pacing on the final quarter of the path using approachEaseIn().
+//   • Shift timing uses keyLeadMs/keyLagMs from MouseService.Timings.
+//   • Optional overshoot (+ swift correction) before dwell/press.
+//   • Per-step drift: applies tiny AR(1) bias from MouseService.stepBiasDrift().
+//   • Instrumentation: logs per-click metrics and rolling histograms for
+//     pressLag (settle), reaction, and hold. Summarized every N clicks.
+// -----------------------------------------------------------------------------
 
 package ht.heist.corerl.input;
 
 import ht.heist.corejava.api.input.MouseService;
 import ht.heist.corejava.input.MouseServiceImpl;
-import ht.heist.corejava.input.HumanizerImpl; // <-- pass this into MouseServiceImpl
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import java.awt.Canvas;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.Shape;
@@ -41,30 +37,33 @@ public final class HumanMouse
 {
     private static final Logger log = LoggerFactory.getLogger(HumanMouse.class);
 
-    // IO bridge that talks to the RuneLite Canvas (dispatches AWT events)
-    private final MouseGateway io;
+    private final MouseGateway io;          // Canvas event injector (no Robot)
+    private final MouseService mouse;       // Pure-Java planner / timing provider
+    private final ExecutorService exec;     // Single worker thread
 
-    // Pure-Java planner providing all "feel" (path & timings)
-    private final MouseService mouse;
+    private volatile Consumer<Point> tapSink = null; // optional logging callback
+    private volatile Point lastMouse = null;         // previous target
 
-    // Worker so we do not block the game thread
-    private final ExecutorService exec;
+    // Ease-out parameters
+    private static final double EASE_OUT_START_FRAC = 0.75; // last 25%
+    private static final double EASE_OUT_MAX_GAIN   = 0.45; // up to +45% delay
 
-    // Optional: notified right before we press at target (e.g., logger/HUD)
-    private volatile Consumer<Point> tapSink = null;
+    // Overshoot guards
+    private static final int OVERSHOOT_MIN_PX = 2;
+    private static final int OVERSHOOT_MAX_PX_HARD = 6;
 
-    // We remember the last point we moved to for smoother next arcs
-    private volatile Point lastMouse = null;
+    // Instrumentation (rolling histograms)
+    private final Hist pressLagHist = new Hist(new int[]{  0,  50, 100, 150, 200, 250, 300, 400, 600, 1000});
+    private final Hist reactionHist = new Hist(new int[]{  0,  50, 100, 150, 200, 300, 450, 600});
+    private final Hist holdHist     = new Hist(new int[]{  0,  40,  60,  80, 120, 180, 260});
+    private int metricCount = 0;
+    private static final int METRIC_SUMMARY_EVERY = 25;
 
     @Inject
     public HumanMouse(MouseGateway io)
     {
         this.io = io;
-
-        // *** FIX: your MouseServiceImpl expects a Humanizer argument. ***
-        // If you later add a no-arg ctor, you can revert to new MouseServiceImpl().
-        this.mouse = new MouseServiceImpl(new HumanizerImpl());
-
+        this.mouse = new MouseServiceImpl(); // centralize "feel"
         this.exec = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "Heist-HumanMouse");
             t.setDaemon(true);
@@ -72,37 +71,18 @@ public final class HumanMouse
         });
     }
 
-    // -------------------------------------------------------------------------
-    // Session lifecycle
-    // -------------------------------------------------------------------------
-
-    /**
-     * Call at the start of a run/session.
-     *  • Resets gateway “entered” guard so first move primes hover.
-     *  • Seeds lastMouse from actual RL pointer if available.
-     */
-    public void onSessionStart()
-    {
-        io.resetEnteredFlag();
-        Point cur = io.currentMouseCanvasPoint();
-        lastMouse = (cur != null ? new Point(cur) : null);
-    }
-
     public void setTapSink(Consumer<Point> sink) { this.tapSink = sink; }
 
     // -------------------------------------------------------------------------
-    // Public click helpers
+    // Public helpers
     // -------------------------------------------------------------------------
-
-    /** Click somewhere inside an arbitrary shape (e.g., convex hull). */
     public void clickHull(Shape hull, boolean shift)
     {
         if (hull == null) return;
-        final Point target = mouse.pickPointInShape(hull); // humanized point-in-shape
+        final Point target = mouse.pickPointInShape(hull);
         submitMoveReactClick(target, shift);
     }
 
-    /** Click somewhere inside a rectangle (rect is-a Shape). */
     public void clickRect(Rectangle rect, boolean shift)
     {
         if (rect == null) return;
@@ -110,7 +90,6 @@ public final class HumanMouse
         submitMoveReactClick(target, shift);
     }
 
-    /** Click an explicit canvas point. */
     public void clickPoint(Point target, boolean shift)
     {
         if (target == null) return;
@@ -118,80 +97,133 @@ public final class HumanMouse
     }
 
     // -------------------------------------------------------------------------
-    // Internal: plan path from REAL pointer → move along → react → click
+    // Core sequence
     // -------------------------------------------------------------------------
-
     private void submitMoveReactClick(Point target, boolean shift)
     {
         exec.submit(() -> {
             try
             {
-                // 1) Resolve a real starting point — prefer RL’s actual pointer
-                Point from = null;
-                Point cur = io.currentMouseCanvasPoint();
-                if (cur != null && cur.x >= 0 && cur.y >= 0) {
-                    from = new Point(cur);
-                } else if (lastMouse != null) {
-                    from = lastMouse;
-                }
-                // Last resort: a tiny pre-approach behind the target
-                if (from == null) {
-                    int backX = Math.max(0, target.x - 14);
-                    int backY = Math.max(0, target.y - 10);
-                    from = new Point(backX, backY);
-                }
-
-                // 2) Ask pure-Java core to plan a curved path and step pacing
+                // 1) Plan main path
+                final Point from = (lastMouse != null ? lastMouse : target);
                 final MouseService.MousePlan plan = mouse.planPath(from, target);
                 final List<Point> waypoints = plan.path();
                 final int stepMinMs = plan.stepDelayMinMs();
                 final int stepMaxMs = plan.stepDelayMaxMs();
+                final double easeIn = clamp(mouse.approachEaseIn(), 0.0, 1.0);
 
-                // 3) Move along the path (AWT events)
-                if (waypoints != null && !waypoints.isEmpty()) {
-                    log.debug("path_steps n={}", waypoints.size());
-                    for (int i = 0; i < waypoints.size(); i++) {
+                // 2) Move along path with per-step drift + ease-out pacing
+                long lastMoveTs = System.currentTimeMillis();
+                if (waypoints != null && !waypoints.isEmpty())
+                {
+                    for (int i = 0; i < waypoints.size(); i++)
+                    {
                         Point p = waypoints.get(i);
-                        io.dispatchMove(p);
-                        lastMouse = p;
-                        if ((i & 3) == 0) { // light debug every ~4 steps
-                            log.debug("mv i={} x={} y={}", i, p.x, p.y);
+
+                        // apply tiny drift (rounded) for organic feel
+                        double[] drift = mouse.stepBiasDrift();
+                        int dx = (int)Math.round((drift != null && drift.length >= 2) ? drift[0] : 0.0);
+                        int dy = (int)Math.round((drift != null && drift.length >= 2) ? drift[1] : 0.0);
+                        Point q = (dx == 0 && dy == 0) ? p : new Point(p.x + dx, p.y + dy);
+
+                        dispatchMove(q);
+
+                        // ease-out multiplier in last quarter
+                        final double frac = (i + 1) / (double)(waypoints.size() + 1);
+                        int d = uniform(stepMinMs, stepMaxMs);
+                        if (frac >= EASE_OUT_START_FRAC && easeIn > 0.0) {
+                            double t = (frac - EASE_OUT_START_FRAC) / (1.0 - EASE_OUT_START_FRAC);
+                            double gain = easeIn * EASE_OUT_MAX_GAIN * t; // grows toward target
+                            d = (int)Math.round(d * (1.0 + gain));
                         }
-                        sleepMillis(uniform(stepMinMs, stepMaxMs));
+
+                        if (d > 0) Thread.sleep(d);
                     }
                 }
 
-                // Ensure we end at the final target
-                if (lastMouse == null || !lastMouse.equals(target)) {
-                    io.dispatchMove(target);
-                    lastMouse = target;
-                    sleepMillis(uniform(stepMinMs, stepMaxMs));
+                // Ensure we end exactly on the target (no drift here)
+                dispatchMove(target);
+                int finalPause = uniform(stepMinMs, stepMaxMs);
+                if (finalPause > 0) Thread.sleep(finalPause);
+                lastMoveTs = System.currentTimeMillis();
+
+                // 3) Optional overshoot+correction BEFORE dwell/press
+                //    (We will re-ensure dwell after we return to target.)
+                if (ThreadLocalRandom.current().nextDouble() < clamp(mouse.overshootProb(), 0.0, 1.0))
+                {
+                    // pick distance (2..min(6, overshootMax))
+                    int maxPx = (int)Math.round(Math.min(mouse.overshootMaxPx(), OVERSHOOT_MAX_PX_HARD));
+                    maxPx = Math.max(OVERSHOOT_MIN_PX, maxPx);
+                    int distPx = uniform(OVERSHOOT_MIN_PX, maxPx);
+
+                    // compute beyond point from 'from'→target direction
+                    Point beyond = moveBeyond(target, from, distPx);
+
+                    // quick out
+                    playLinearFast(lastMouseOrTarget(from, target), beyond, 3);
+                    // small correction pause
+                    int corrPause = gaussianNonNegative(mouse.correctionPauseMeanMs(), mouse.correctionPauseStdMs());
+                    if (corrPause > 0) Thread.sleep(corrPause);
+                    // quick back to target (exact)
+                    playLinearFast(beyond, target, 3);
+
+                    // we just moved again; reset lastMoveTs so dwell accounts from now
+                    lastMoveTs = System.currentTimeMillis();
                 }
 
-                // 4) Reaction BEFORE press (Gaussian from Timings)
+                // 4) Timing plan (dwell/react/hold + key lead/lag)
                 final MouseService.Timings timings = mouse.planTimings();
+                final int dwellMin = timings.dwellMinMs();
+                final int dwellMax = timings.dwellMaxMs();
+                final int dwellTarget = uniform(dwellMin, dwellMax);
+
                 final int reactMs = gaussianNonNegative(timings.reactMeanMs(), timings.reactStdMs());
-                sleepMillis(reactMs);
+                if (reactMs > 0) Thread.sleep(reactMs);
 
-                // Tap sink (optional) — just before press
+                int keyLeadMs = shift ? Math.max(0, timings.keyLeadMs()) : 0;
+                int keyLagMs  = shift ? Math.max(0, timings.keyLagMs())  : 0;
+
+                // Guarantee dwell: ensure (now + keyLeadMs) - lastMoveTs >= dwellTarget
+                long elapsedAfterReaction = System.currentTimeMillis() - lastMoveTs;
+                long extra = dwellTarget - (elapsedAfterReaction + keyLeadMs);
+                if (extra > 0) Thread.sleep((int)Math.min(extra, Integer.MAX_VALUE));
+
+                // 5) Tap sink (optional) — just before we press
                 final Consumer<Point> sink = this.tapSink;
-                if (sink != null) {
-                    try { sink.accept(target); } catch (Throwable ignored) {}
-                }
+                if (sink != null) { try { sink.accept(target); } catch (Throwable ignored) {} }
 
-                // 5) Click (optionally with Shift); hold sampled uniformly by gateway
-                final int holdMin = timings.holdMinMs();
-                final int holdMax = timings.holdMaxMs();
+                // 6) Press/hold/release (LEFT) with model-driven SHIFT timing
+                final int holdMs = uniform(timings.holdMinMs(), timings.holdMaxMs());
 
+                // measure (press_ts - last_move_ts) precisely: just before press
                 if (shift) {
                     io.shiftDown();
-                    sleepMillis(30); // small safety lead
-                    io.clickAt(target, holdMin, holdMax, true);
-                    sleepMillis(30); // small safety lag
-                    io.shiftUp();
-                } else {
-                    io.clickAt(target, holdMin, holdMax, false);
+                    if (keyLeadMs > 0) Thread.sleep(keyLeadMs);
                 }
+                long pressLagMs = System.currentTimeMillis() - lastMoveTs;
+
+                io.clickAt(target, holdMs, holdMs, shift); // pass exact hold via equal min/max
+
+                if (shift && keyLagMs > 0) Thread.sleep(keyLagMs);
+                if (shift) io.shiftUp();
+
+                // 7) Metrics / histograms
+                pressLagHist.add((int)pressLagMs);
+                reactionHist.add(reactMs);
+                holdHist.add(holdMs);
+                metricCount++;
+                if (metricCount % METRIC_SUMMARY_EVERY == 0) {
+                    log.info("[humanmouse] metrics{} pressLag={} reaction={} hold={}",
+                            metricCount,
+                            pressLagHist.summary("ms"),
+                            reactionHist.summary("ms"),
+                            holdHist.summary("ms"));
+                } else {
+                    log.debug("[humanmouse] pressLag={}ms react={}ms hold={}ms", pressLagMs, reactMs, holdMs);
+                }
+
+                // 8) Book-keeping for next arc
+                lastMouse = target;
             }
             catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
@@ -203,30 +235,106 @@ public final class HumanMouse
     }
 
     // -------------------------------------------------------------------------
-    // Small helpers
+    // Helpers
     // -------------------------------------------------------------------------
 
-    /** Inclusive uniform int in [min..max]; clamps to ≥0 and swaps if needed. */
+    private void dispatchMove(Point p)
+    {
+        if (p == null) return;
+        final Canvas c = io.canvasOrNull();
+        if (c == null) return;
+        io.dispatchMove(p);
+    }
+
+    private void playLinearFast(Point from, Point to, int steps) throws InterruptedException
+    {
+        if (from == null || to == null) return;
+        for (int i = 0; i < steps; i++)
+        {
+            double t = i / (double)(steps - 1);
+            int x = (int)Math.round(from.x + (to.x - from.x) * t);
+            int y = (int)Math.round(from.y + (to.y - from.y) * t);
+
+            // add tiny drift so even corrections look organic
+            double[] drift = mouse.stepBiasDrift();
+            x += (int)Math.round((drift != null && drift.length >= 2) ? drift[0] : 0.0);
+            y += (int)Math.round((drift != null && drift.length >= 2) ? drift[1] : 0.0);
+
+            dispatchMove(new Point(x, y));
+            Thread.sleep(uniform(2, 5));
+        }
+        // land exactly on 'to' (no drift)
+        dispatchMove(to);
+        Thread.sleep(uniform(2, 5));
+    }
+
+    private static Point moveBeyond(Point target, Point start, int pixels)
+    {
+        if (start == null || target == null) return target;
+        double dx = target.x - start.x;
+        double dy = target.y - start.y;
+        double len = Math.max(1e-6, Math.hypot(dx, dy));
+        double ux = dx / len;
+        double uy = dy / len;
+        return new Point(
+                (int)Math.round(target.x + ux * pixels),
+                (int)Math.round(target.y + uy * pixels)
+        );
+    }
+
+    private static Point lastMouseOrTarget(Point last, Point fallback) {
+        return (last != null) ? last : fallback;
+    }
+
     private static int uniform(int min, int max)
     {
         if (max < min) { int t = min; min = max; max = t; }
-        if (max <= 0) return 0;
-        if (min < 0) min = 0;
-        return ThreadLocalRandom.current().nextInt(min, max + 1);
+        if (min <= 0 && max <= 0) return 0;
+        final int lo = Math.max(0, min);
+        final int hi = Math.max(0, max);
+        return ThreadLocalRandom.current().nextInt(lo, hi + 1);
     }
 
-    /** Gaussian sample clamped to ≥ 0. */
     private static int gaussianNonNegative(int mean, int std)
     {
         if (mean <= 0 && std <= 0) return 0;
-        double g = ThreadLocalRandom.current().nextGaussian(); // mean=0, std=1
+        double g = ThreadLocalRandom.current().nextGaussian();
         long v = Math.round(mean + g * std);
         return (int)Math.max(0, v);
     }
 
-    /** Simple sleep helper. */
-    private static void sleepMillis(int ms) throws InterruptedException
-    {
-        if (ms > 0) Thread.sleep(ms);
+    private static double clamp(double v, double lo, double hi) {
+        return (v < lo) ? lo : (v > hi ? hi : v);
+    }
+
+    // ---------------------- tiny histogram for instrumentation ---------------
+    private static final class Hist {
+        private final int[] edges; // inclusive lower bounds; last is ">= last"
+        private final int[] bins;  // counts
+
+        Hist(int[] edges) {
+            this.edges = edges.clone();
+            this.bins  = new int[edges.length];
+        }
+
+        void add(int v) {
+            int idx = edges.length - 1;
+            for (int i = 0; i < edges.length; i++) {
+                if (v < edges[i]) { idx = Math.max(0, i - 1); break; }
+            }
+            bins[idx]++;
+        }
+
+        String summary(String unit) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < edges.length; i++) {
+                String range = (i == edges.length - 1)
+                        ? (edges[i] + "+")
+                        : (edges[i] + "-" + (edges[i + 1] - 1));
+                sb.append(range).append(unit).append("=").append(bins[i]);
+                if (i < edges.length - 1) sb.append(" ");
+            }
+            return sb.toString();
+        }
     }
 }

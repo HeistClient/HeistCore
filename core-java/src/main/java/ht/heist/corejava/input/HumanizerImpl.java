@@ -10,10 +10,6 @@
 //   Pure-Java provider of human-like timing + path parameters used by
 //   MouseServiceImpl. This implements ht.heist.corejava.api.input.Humanizer,
 //   so it can be passed directly to MouseServiceImpl(..).
-//
-// NOTE
-//   This is separate from any HumanizerImpl you keep in core-rl. They serve
-//   different layers. Do not cross-reference core-rl from core-java.
 // ============================================================================
 
 package ht.heist.corejava.input;
