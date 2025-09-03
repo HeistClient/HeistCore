@@ -4,25 +4,16 @@
 // PACKAGE: ht.heist.corejava.input
 // -----------------------------------------------------------------------------
 // TITLE
-//   HumanizerImpl — Default "feel" implementation with jitter + drift + fatigue
+//   HumanizerImpl — Default "feel" impl for the core-java Humanizer API
 //
-// WHAT THIS CLASS PROVIDES
-//   • All timings (dwell/reaction/hold, key lead/lag) with Gaussian-ish sampling.
-//   • Path parameters (curvature with jitter, micro-wobble, step pacing).
-//   • Sticky AR(1) drift for slight bias that evolves across actions.
-//   • Overshoot/correction knobs (probability, magnitude, pause).
-//   • Approach ease-in (slows near target).
-//   • Fatigue multiplier and session lifecycle hook.
-//
-// WHY STATEFUL?
-//   Drift is stateful to create "sticky" shape bias. Fatigue can be adjusted over
-//   time by a higher-level controller (e.g., IdleController).
-//
-// THREADING
-//   Extremely light state; commonly used on a single input thread.
+// ROLE
+//   Pure-Java provider of human-like timing + path parameters used by
+//   MouseServiceImpl. This implements ht.heist.corejava.api.input.Humanizer,
+//   so it can be passed directly to MouseServiceImpl(..).
 //
 // NOTE
-//   Defaults match your previous feel, with mild improvements for variety.
+//   This is separate from any HumanizerImpl you keep in core-rl. They serve
+//   different layers. Do not cross-reference core-rl from core-java.
 // ============================================================================
 
 package ht.heist.corejava.input;
@@ -63,7 +54,7 @@ public final class HumanizerImpl implements Humanizer
     private final double driftNoiseStd;   // e.g., 0.90
     private final double driftClampAbs;   // e.g., 3.0 (px)
 
-    private double driftX = 0.0;          // mutable tiny bias state
+    private double driftX = 0.0;          // tiny bias state
     private double driftY = 0.0;
 
     // ---- Overshoot/correction knobs ----------------------------------------
@@ -77,25 +68,25 @@ public final class HumanizerImpl implements Humanizer
 
     // ---- Constructors -------------------------------------------------------
 
-    /** Default profile: safe, human-ish settings aligned with prior feel. */
+    /** Default profile aligned with your previous feel. */
     public HumanizerImpl() {
         this(
                 // timing (dwell, reaction, hold)
-                240, 360,     // dwell min/max
-                150, 45,      // reaction mean/std
-                42,  65,      // hold min/max
+                240, 360,    // dwell min/max
+                150, 45,     // reaction mean/std
+                42,  65,     // hold min/max
                 // key waits
-                25, 30, 8,    // key min/mean/std (lead & lag symmetric)
+                25, 30, 8,   // key min/mean/std (lead & lag symmetric)
                 // path & pacing
-                0.55, 0.12,   // curvature mean/std (NEW: jitter per path)
-                1.6,          // micro wobble px
-                6, 12,        // step min/max ms
-                0.35,         // approach ease-in [0..1]
+                0.55, 0.12,  // curvature mean/std (per-path jitter)
+                1.6,         // micro wobble px
+                6, 12,       // step min/max ms
+                0.35,        // approach ease-in [0..1]
                 // drift
                 0.86, 0.90, 3.0, // alpha, noise, clampAbs
                 // overshoot
-                0.10, 12.0,   // prob, max overshoot px
-                70,  25       // correction pause mean/std ms
+                0.10, 12.0,  // prob, max overshoot px
+                70,  25      // correction pause mean/std ms
         );
     }
 
@@ -135,10 +126,10 @@ public final class HumanizerImpl implements Humanizer
         this.driftNoiseStd = Math.max(0.0, driftNoiseStd);
         this.driftClampAbs = Math.max(0.1, driftClampAbs);
 
-        this.overshootProb        = clamp(overshootProb, 0.0, 1.0);
-        this.overshootMaxPx       = Math.max(0.0, overshootMaxPx);
-        this.correctionPauseMeanMs= Math.max(0, correctionPauseMeanMs);
-        this.correctionPauseStdMs = Math.max(0, correctionPauseStdMs);
+        this.overshootProb         = clamp(overshootProb, 0.0, 1.0);
+        this.overshootMaxPx        = Math.max(0.0, overshootMaxPx);
+        this.correctionPauseMeanMs = Math.max(0, correctionPauseMeanMs);
+        this.correctionPauseStdMs  = Math.max(0, correctionPauseStdMs);
     }
 
     // ---- Humanizer API: timings --------------------------------------------
@@ -197,15 +188,13 @@ public final class HumanizerImpl implements Humanizer
 
     // ---- Humanizer API: fatigue & session -----------------------------------
 
-    @Override public double fatigueLevel()          { return fatigue01; }
+    @Override public double fatigueLevel() { return fatigue01; }
     @Override public void   setFatigueLevel(double f) { fatigue01 = clamp(f, 0.0, 1.0); }
 
     @Override
     public void onSessionStart() {
-        // Reset drift so each session starts "fresh".
         driftX = 0.0;
         driftY = 0.0;
-        // Optionally reset fatigue too:
         fatigue01 = 0.0;
     }
 
