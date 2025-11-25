@@ -1,34 +1,28 @@
-<!--
-  ============================================================================
-  FILE: HeistCore/core-java/pom.xml
-  ROLE: PURE Java core (no RuneLite deps)
-  PURPOSE:
-    • Hosts API contracts and pure implementations.
-  ============================================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Heist Core - Java POM
+     - Logging dependency adjusted to match RuneLite (slf4j 1.7.25, scope provided).
+     - Contains pure Java logic (no RuneLite-specific references).
 -->
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+<parent>
+<groupId>ht.heist</groupId>
+<artifactId>heist-parent</artifactId>
+<version>1.0-SNAPSHOT</version>
+<relativePath>../pom.xml</relativePath>
+</parent>
+<modelVersion>4.0.0</modelVersion>
+<artifactId>core-java</artifactId>
+<packaging>jar</packaging>
+<name>Heist Core - Java</name>
 
-    <parent>
-        <groupId>ht.heist</groupId>
-        <artifactId>heist-parent</artifactId>
-        <version>1.0-SNAPSHOT</version>
-        <relativePath>../pom.xml</relativePath>
-    </parent>
-
-    <modelVersion>4.0.0</modelVersion>
-    <artifactId>core-java</artifactId>
-    <packaging>jar</packaging>
-    <name>Heist Core - Java</name>
-
-    <dependencies>
-        <!-- Keep deps minimal; add only what PURE Java needs -->
-        <!-- SLF4J API so core-java can compile against org.slf4j.Logger -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>2.0.13</version>
-        </dependency>
-    </dependencies>
-</project>
+<dependencies>
+<!-- SLF4J API for logging (use RuneLite's version, not shaded) -->
+<dependency>
+    <groupId>org.slf4j</groupId>
+    <artifactId>slf4j-api</artifactId>
+    <version>${slf4j.api.version}</version>   <!-- 1.7.25, defined in parent -->
+    <scope>provided</scope>                   <!-- Provided by RuneLite at runtime -->
+</dependency>
+<!-- (Keep other dependencies minimal since this is pure Java logic) -->
+</dependencies>
+        </project>

@@ -1,52 +1,49 @@
-<!--
-  ============================================================================
-  FILE: HeistCore/pom.xml
-  ROLE: Parent / Aggregator POM
-  PURPOSE:
-    • Defines shared properties (Java 11, encoding, RuneLite version).
-    • Declares repositories (RuneLite, JitPack).
-    • Lists all child modules in build order.
-  ============================================================================
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Heist Parent POM
+     - Updated runelite.version to 1.12.7-SNAPSHOT (to pull in updated RuneLite artifacts).
+     - Defines shared build properties and modules for Heist project.
 -->
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+<modelVersion>4.0.0</modelVersion>
+<groupId>ht.heist</groupId>
+<artifactId>heist-parent</artifactId>
+<version>1.0-SNAPSHOT</version>
+<packaging>pom</packaging>
+<name>Heist Parent</name>
 
-    <modelVersion>4.0.0</modelVersion>
-    <groupId>ht.heist</groupId>
-    <artifactId>heist-parent</artifactId>
-    <version>1.0-SNAPSHOT</version>
-    <packaging>pom</packaging>
-    <name>Heist Parent</name>
+        <!-- Shared properties for all sub-modules -->
+<properties>
+<maven.compiler.source>11</maven.compiler.source>
+<maven.compiler.target>11</maven.compiler.target>
+<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-    <!-- Shared props for all children -->
-    <properties>
-        <maven.compiler.source>11</maven.compiler.source>
-        <maven.compiler.target>11</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+<!-- Align with local RuneLite client version -->
+<runelite.version>1.12.7-SNAPSHOT</runelite.version>  <!-- Updated to latest RuneLite version -->
+<!-- (Make sure this matches the RuneLite client you run against) -->
 
-        <!-- Keep this aligned with your local RL client -->
-        <runelite.version>1.11.15-SNAPSHOT</runelite.version>
-    </properties>
+<!-- Optionally define logging version to match RuneLite -->
+<slf4j.api.version>1.7.25</slf4j.api.version>         <!-- Match RuneLite's SLF4J API version -->
+</properties>
 
-    <!-- Repositories for RL artifacts and (optionally) JitPack -->
-    <repositories>
-        <repository>
-            <id>runelite</id>
-            <url>https://repo.runelite.net</url>
-        </repository>
-        <repository>
-            <id>jitpack.io</id>
-            <url>https://jitpack.io</url>
-        </repository>
-    </repositories>
+        <!-- Repositories for RuneLite and others -->
+<repositories>
+<repository>
+    <id>runelite</id>
+    <url>https://repo.runelite.net</url>
+</repository>
+<repository>
+    <id>jitpack.io</id>
+    <url>https://jitpack.io</url>
+</repository>
+</repositories>
 
-    <!-- Modules: exact hierarchy you specified -->
-    <modules>
-        <module>core-java</module>
-        <module>core-rl</module>
-        <module>heist-hud</module>
-        <module>woodcutter-plugin</module>
-        <module>sideload-dist</module>
-    </modules>
-</project>
+        <!-- Modules in build order -->
+<modules>
+<module>core-java</module>
+<module>core-rl</module>
+<module>heist-hud</module>
+<module>woodcutter-plugin</module>
+<module>sideload-dist</module>
+<!-- Note: heist-bundle omitted (if choosing separate plugin jars approach) -->
+</modules>
+        </project>

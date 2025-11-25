@@ -1,71 +1,68 @@
-<!-- =========================================================================
-     MODULE: core-rl
-     ROLE: RuneLite-dependent core (AWT dispatch, RL adapters)
-     DEPENDS ON: core-java (pure Java mouse planner/timings)
-     ========================================================================= -->
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Heist Core - RL POM
+     - Logging dependency aligned with RuneLite (slf4j 1.7.25, provided).
+     - Depends on core-java and RuneLite API/Client.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+<parent>
+<groupId>ht.heist</groupId>
+<artifactId>heist-parent</artifactId>
+<version>1.0-SNAPSHOT</version>
+<relativePath>../pom.xml</relativePath>
+</parent>
+<modelVersion>4.0.0</modelVersion>
+<artifactId>core-rl</artifactId>
+<packaging>jar</packaging>
+<name>Heist Core (RuneLite)</name>
 
-    <parent>
-        <groupId>ht.heist</groupId>
-        <artifactId>heist-parent</artifactId>
-        <version>1.0-SNAPSHOT</version>
-        <relativePath>../pom.xml</relativePath>
-    </parent>
+<dependencies>
+<!-- Core Java module (pure implementations) -->
+<dependency>
+    <groupId>ht.heist</groupId>
+    <artifactId>core-java</artifactId>
+    <version>${project.version}</version>
+</dependency>
+<!-- RuneLite API (interfaces) - provided by host client -->
+<dependency>
+    <groupId>net.runelite</groupId>
+    <artifactId>runelite-api</artifactId>
+    <version>${runelite.version}</version>
+    <scope>provided</scope>
+</dependency>
+<!-- RuneLite Client (for any internal classes used) - provided by host -->
+<dependency>
+    <groupId>net.runelite</groupId>
+    <artifactId>client</artifactId>
+    <version>${runelite.version}</version>
+    <scope>provided</scope>
+</dependency>
+<!-- Dependency Injection annotations (JSR 330) -->
+<dependency>
+    <groupId>javax.inject</groupId>
+    <artifactId>javax.inject</artifactId>
+    <version>1</version>
+    <scope>provided</scope>
+</dependency>
+<!-- SLF4J API for logging (match RuneLite's version) -->
+<dependency>
+    <groupId>org.slf4j</groupId>
+    <artifactId>slf4j-api</artifactId>
+    <version>${slf4j.api.version}</version>   <!-- 1.7.25 to align with RuneLite -->
+    <scope>provided</scope>                   <!-- Provided by RuneLite runtime -->
+</dependency>
+</dependencies>
 
-    <modelVersion>4.0.0</modelVersion>
-    <artifactId>core-rl</artifactId>
-    <packaging>jar</packaging>
-    <name>Heist Core (RuneLite)</name>
-
-    <dependencies>
-        <!-- DEP: core-java (MouseService API + MouseServiceImpl implementation) -->
-        <dependency>
-            <groupId>ht.heist</groupId>
-            <artifactId>core-java</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-
-        <!-- RuneLite API (provided by host at runtime) -->
-        <dependency>
-            <groupId>net.runelite</groupId>
-            <artifactId>runelite-api</artifactId>
-            <version>${runelite.version}</version>
-            <scope>provided</scope>
-        </dependency>
-        <dependency>
-            <groupId>net.runelite</groupId>
-            <artifactId>client</artifactId>
-            <version>${runelite.version}</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <!-- @Inject / @Singleton -->
-        <dependency>
-            <groupId>javax.inject</groupId>
-            <artifactId>javax.inject</artifactId>
-            <version>1</version>
-            <scope>provided</scope>
-        </dependency>
-        <!-- SLF4J API (compile only); RL provides the runtime binding -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>2.0.13</version>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-jar-plugin</artifactId>
-                <version>3.4.1</version>
-                <configuration>
-                    <finalName>${project.artifactId}-${project.version}</finalName>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
-</project>
+<build>
+<plugins>
+    <!-- (Optional) Specify final jar name for clarity -->
+    <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.1</version>
+        <configuration>
+            <finalName>${project.artifactId}-${project.version}</finalName>
+        </configuration>
+    </plugin>
+</plugins>
+</build>
+        </project>
